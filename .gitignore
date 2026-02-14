@@ -1,0 +1,7 @@
+gcp-docs-mirror
+tmp/
+docs/
+urls.txt
+redirect_cache.txt
+failed_urls.txt
+.DS_Store
