@@ -25,9 +25,10 @@ const (
 	batchSize            = 20
 	maxRecursiveDepth    = 5
 	maxConsecutiveErrors = 3
-	// 100 requests per minute = 1 request every 600ms.
-	// We'll use 700ms to be safe.
-	apiRateLimitInterval = 700 * time.Millisecond
+	
+	// API Quota: 100 requests per minute
+	quotaMaxBurst = 100.0
+	quotaRefillRatePerSec = 100.0 / 60.0
 )
 
 type stringSlice []string
@@ -59,7 +60,10 @@ type MirrorApp struct {
 	redirects     map[string]string
 	failedURLs    map[string]bool
 	mdParser      goldmark.Markdown
-	lastRequestAt time.Time
+	
+	// Budget Management
+	tokens        float64
+	lastRefill    time.Time
 }
 
 type Document struct {
@@ -118,6 +122,8 @@ func main() {
 		redirects:     make(map[string]string),
 		failedURLs:    make(map[string]bool),
 		mdParser:      goldmark.New(),
+		tokens:        quotaMaxBurst,
+		lastRefill:    time.Now(),
 	}
 
 	if err := app.Run(seeds); err != nil {
@@ -202,8 +208,28 @@ func (a *MirrorApp) isProcessedSession(u string) bool {
 	return a.processedURLs[u] || a.failedURLs[u] || a.redirects[u] != ""
 }
 
+func (a *MirrorApp) takeToken() {
+	now := time.Now()
+	elapsed := now.Sub(a.lastRefill).Seconds()
+	a.tokens += elapsed * quotaRefillRatePerSec
+	if a.tokens > quotaMaxBurst {
+		a.tokens = quotaMaxBurst
+	}
+	a.lastRefill = now
+
+	if a.tokens < 1.0 {
+		waitTime := time.Duration((1.0 - a.tokens) / quotaRefillRatePerSec * float64(time.Second))
+		time.Sleep(waitTime)
+		a.takeToken()
+		return
+	}
+	a.tokens -= 1.0
+}
+
 func (a *MirrorApp) fetchAndExtractLinks(u string, targetClasses []string) []string {
 	fmt.Printf("  Scanning HTML: %s\n", u)
+	a.takeToken()
+	
 	resp, err := http.Get(u)
 	if err != nil {
 		fmt.Printf("    Warning: %v\n", err)
@@ -387,16 +413,17 @@ func (a *MirrorApp) processBatchRecursive(urls []string) error {
 }
 
 func (a *MirrorApp) fetchDocsWithRetry(urls []string) ([]Document, *APIError) {
-	backoff := 5 * time.Second
 	for i := 0; i < 5; i++ {
 		docs, apiErr := a.fetchDocs(urls)
 		if apiErr == nil {
 			return docs, nil
 		}
 		if apiErr.Error.Code == 429 || apiErr.Error.Status == "RESOURCE_EXHAUSTED" {
-			fmt.Printf("\n  [Quota Exceeded] Waiting %v and retrying (%d/5)... ", backoff, i+1)
-			time.Sleep(backoff)
-			backoff *= 2
+			waitTime := 65 * time.Second
+			fmt.Printf("\n  [Quota Exceeded] Waiting %v for window reset (%d/5)... ", waitTime, i+1)
+			time.Sleep(waitTime)
+			a.tokens = quotaMaxBurst
+			a.lastRefill = time.Now()
 			continue
 		}
 		return nil, apiErr
@@ -405,11 +432,7 @@ func (a *MirrorApp) fetchDocsWithRetry(urls []string) ([]Document, *APIError) {
 }
 
 func (a *MirrorApp) fetchDocs(urls []string) ([]Document, *APIError) {
-	// Proactive Rate Limiting
-	sinceLast := time.Since(a.lastRequestAt)
-	if sinceLast < apiRateLimitInterval {
-		time.Sleep(apiRateLimitInterval - sinceLast)
-	}
+	a.takeToken()
 
 	v := url.Values{}
 	for _, u := range urls {
@@ -419,7 +442,6 @@ func (a *MirrorApp) fetchDocs(urls []string) ([]Document, *APIError) {
 	req, _ := http.NewRequest("GET", reqURL, nil)
 	req.Header.Set("X-Goog-Api-Key", a.cfg.APIKey)
 
-	a.lastRequestAt = time.Now()
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, makeSimpleError(err.Error())
