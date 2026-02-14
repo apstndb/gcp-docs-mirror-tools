@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/text"
@@ -40,17 +41,18 @@ func (s *stringSlice) Set(value string) error {
 }
 
 type Config struct {
-	APIKey         string
-	DocsDir        string
-	MasterList     string
-	RedirectLog    string
-	FailedLog      string
-	MetadataFile   string
-	Recursive      bool
-	Refresh        bool
-	Prefixes       []string
-	QuotaPerMinute float64
-	QuotaWait      time.Duration
+	APIKey         string        `toml:"-"`
+	DocsDir        string        `toml:"docs_dir"`
+	MasterList     string        `toml:"master_list"`
+	RedirectLog    string        `toml:"redirect_log"`
+	FailedLog      string        `toml:"failed_log"`
+	MetadataFile   string        `toml:"metadata_file"`
+	Recursive      bool          `toml:"recursive"`
+	Refresh        bool          `toml:"refresh"`
+	Prefixes       []string      `toml:"prefixes"`
+	Seeds          []string      `toml:"seeds"`
+	QuotaPerMinute float64       `toml:"qpm"`
+	QuotaWait      time.Duration `toml:"qw"`
 }
 
 type MirrorApp struct {
@@ -79,6 +81,7 @@ type APIError struct {
 }
 
 func main() {
+	configPath := flag.String("config", "", "Path to TOML configuration file")
 	recursive := flag.Bool("r", false, "Recursive discovery from Markdown content")
 	refresh := flag.Bool("f", false, "Refresh existing documents")
 	docsDir := flag.String("docs", "docs", "Output directory for documents")
@@ -90,16 +93,10 @@ func main() {
 	flag.Var(&prefixes, "prefix", "Path prefix(es) to mirror (comma-separated or multiple flags).")
 	
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] <seed_url> [<seed_url> ...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] [<seed_url> ...]\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-
-	seeds := flag.Args()
-	if len(seeds) == 0 && !*refresh {
-		flag.Usage()
-		os.Exit(1)
-	}
 
 	apiKey := os.Getenv("DEVELOPERKNOWLEDGE_API_KEY")
 	if apiKey == "" {
@@ -107,31 +104,47 @@ func main() {
 		os.Exit(1)
 	}
 
-	if len(prefixes) == 0 {
-		prefixes = []string{"/spanner/docs/"}
+	cfg := &Config{
+		DocsDir:        *docsDir,
+		MasterList:     "urls.txt",
+		RedirectLog:    "redirect_cache.txt",
+		FailedLog:      "failed_urls.txt",
+		MetadataFile:   *metadata,
+		Recursive:      *recursive,
+		Refresh:        *refresh,
+		Prefixes:       prefixes,
+		QuotaPerMinute: *qpm,
+		QuotaWait:      *qw,
+	}
+
+	if *configPath != "" {
+		if _, err := toml.DecodeFile(*configPath, cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Error decoding config: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// Command line seeds override/append to config seeds
+	seeds := append(cfg.Seeds, flag.Args()...)
+	if len(seeds) == 0 && !cfg.Refresh {
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	if len(cfg.Prefixes) == 0 {
+		cfg.Prefixes = []string{"/spanner/docs/"}
 	}
 
 	app := &MirrorApp{
-		cfg: &Config{
-			APIKey:         apiKey,
-			DocsDir:       *docsDir,
-			MasterList:    "urls.txt",
-			RedirectLog:    "redirect_cache.txt",
-			FailedLog:      "failed_urls.txt",
-			MetadataFile:   *metadata,
-			Recursive:      *recursive,
-			Refresh:        *refresh,
-			Prefixes:       prefixes,
-			QuotaPerMinute: *qpm,
-			QuotaWait:      *qw,
-		},
+		cfg:           cfg,
 		processedURLs: make(map[string]bool),
 		redirects:     make(map[string]string),
 		failedURLs:    make(map[string]bool),
 		mdParser:      goldmark.New(),
-		tokens:        *qpm,
+		tokens:        cfg.QuotaPerMinute,
 		lastRefill:    time.Now(),
 	}
+	app.cfg.APIKey = apiKey
 
 	if err := app.Run(seeds); err != nil {
 		fmt.Fprintf(os.Stderr, "Fatal Error: %v\n", err)
