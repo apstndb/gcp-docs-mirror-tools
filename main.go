@@ -506,11 +506,11 @@ func (a *MirrorApp) fetchDocs(urls []string) ([]Document, *APIError) {
 	}
 
 	if res.Error != nil {
-		e := &APIError{}
-		e.Error.Code = res.Error.Code
-		e.Error.Message = res.Error.Message
-		e.Error.Status = res.Error.Status
-		return nil, e
+		apiErr := &APIError{}
+		apiErr.Error.Code = res.Error.Code
+		apiErr.Error.Message = res.Error.Message
+		apiErr.Error.Status = res.Error.Status
+		return nil, apiErr
 	}
 	
 	if resp.StatusCode != 200 {
@@ -533,7 +533,11 @@ func (a *MirrorApp) saveDoc(doc Document) {
 	relPath := strings.TrimPrefix(doc.Name, "documents/")
 	fullPath := filepath.Join(a.cfg.DocsDir, relPath+".md")
 	os.MkdirAll(filepath.Dir(fullPath), 0755)
-	os.WriteFile(fullPath, []byte(doc.Content), 0644)
+	
+	// Normalize trailing newline: Trim trailing whitespace and add exactly one newline.
+	content := strings.TrimRight(doc.Content, " \t\r\n") + "\n"
+	os.WriteFile(fullPath, []byte(content), 0644)
+	
 	u := "https://cloud.google.com/" + strings.TrimPrefix(relPath, "docs.cloud.google.com/")
 	a.processedURLs[u] = true
 }
