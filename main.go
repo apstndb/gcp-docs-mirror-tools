@@ -381,6 +381,10 @@ func (a *MirrorApp) discoverLinksFromMirror() []string {
 }
 
 func (a *MirrorApp) resolveAndNormalize(link, basePath string) string {
+	link = strings.Split(link, "#")[0]
+	if link == "" {
+		return "https://docs.cloud.google.com" + basePath
+	}
 	if strings.Contains(link, "://") && !strings.Contains(link, "cloud.google.com") {
 		return ""
 	}
@@ -391,7 +395,6 @@ func (a *MirrorApp) resolveAndNormalize(link, basePath string) string {
 	if !strings.HasPrefix(rel, "/") {
 		rel = path.Join(path.Dir(basePath), rel)
 	}
-	rel = strings.Split(rel, "#")[0]
 	return "https://docs.cloud.google.com" + rel
 }
 
