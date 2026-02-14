@@ -55,6 +55,21 @@ type Config struct {
 	QuotaWait      time.Duration `toml:"qw"`
 }
 
+func DefaultConfig() *Config {
+	return &Config{
+		DocsDir:        "docs",
+		MasterList:     "urls.txt",
+		RedirectLog:    "redirect_cache.txt",
+		FailedLog:      "failed_urls.txt",
+		MetadataFile:   "metadata.yaml",
+		Recursive:      false,
+		Refresh:        false,
+		Prefixes:       []string{"/spanner/docs/"},
+		QuotaPerMinute: 100.0,
+		QuotaWait:      65 * time.Second,
+	}
+}
+
 type MirrorApp struct {
 	cfg           *Config
 	processedURLs map[string]bool
@@ -81,42 +96,15 @@ type APIError struct {
 }
 
 func main() {
-	configPath := flag.String("config", "", "Path to TOML configuration file")
-	recursive := flag.Bool("r", false, "Recursive discovery from Markdown content")
-	refresh := flag.Bool("f", false, "Refresh existing documents")
-	docsDir := flag.String("docs", "docs", "Output directory for documents")
-	metadata := flag.String("metadata", "metadata.yaml", "Path to metadata summary file")
-	qpm := flag.Float64("qpm", 100.0, "Quota per minute (requests per minute)")
-	qw := flag.Duration("qw", 65*time.Second, "Wait duration when quota is exceeded")
-	
-	var prefixes stringSlice
-	flag.Var(&prefixes, "prefix", "Path prefix(es) to mirror (comma-separated or multiple flags).")
-	
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] [<seed_url> ...]\n", os.Args[0])
-		flag.PrintDefaults()
-	}
-	flag.Parse()
+	cfg := DefaultConfig()
 
-	apiKey := os.Getenv("DEVELOPERKNOWLEDGE_API_KEY")
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "Error: DEVELOPERKNOWLEDGE_API_KEY is not set")
-		os.Exit(1)
-	}
+	// 1. First pass to find -config flag
+	tempFS := flag.NewFlagSet("temp", flag.ContinueOnError)
+	tempFS.Usage = func() {} // Silence
+	configPath := tempFS.String("config", "", "")
+	_ = tempFS.Parse(os.Args[1:])
 
-	cfg := &Config{
-		DocsDir:        *docsDir,
-		MasterList:     "urls.txt",
-		RedirectLog:    "redirect_cache.txt",
-		FailedLog:      "failed_urls.txt",
-		MetadataFile:   *metadata,
-		Recursive:      *recursive,
-		Refresh:        *refresh,
-		Prefixes:       prefixes,
-		QuotaPerMinute: *qpm,
-		QuotaWait:      *qw,
-	}
-
+	// 2. Load TOML if provided (overwrites defaults)
 	if *configPath != "" {
 		if _, err := toml.DecodeFile(*configPath, cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Error decoding config: %v\n", err)
@@ -124,16 +112,42 @@ func main() {
 		}
 	}
 
-	// Command line seeds override/append to config seeds
+	// 3. Define real flags with current cfg as defaults
+	var prefixes stringSlice
+	flag.StringVar(&cfg.DocsDir, "docs", cfg.DocsDir, "Output directory for documents")
+	flag.StringVar(&cfg.MasterList, "master-list", cfg.MasterList, "Master list of processed URLs")
+	flag.StringVar(&cfg.MetadataFile, "metadata", cfg.MetadataFile, "Path to metadata summary file")
+	flag.BoolVar(&cfg.Recursive, "r", cfg.Recursive, "Recursive discovery from Markdown content")
+	flag.BoolVar(&cfg.Refresh, "f", cfg.Refresh, "Refresh existing documents")
+	flag.Float64Var(&cfg.QuotaPerMinute, "qpm", cfg.QuotaPerMinute, "Quota per minute (requests per minute)")
+	flag.DurationVar(&cfg.QuotaWait, "qw", cfg.QuotaWait, "Wait duration when quota is exceeded")
+	flag.Var(&prefixes, "prefix", "Path prefix(es) to mirror (overrides config if provided).")
+	
+	_ = flag.String("config", *configPath, "Path to TOML configuration file")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] [<seed_url> ...]\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	// Flags override TOML for slices
+	if len(prefixes) > 0 {
+		cfg.Prefixes = prefixes
+	}
+	
 	seeds := append(cfg.Seeds, flag.Args()...)
 	if len(seeds) == 0 && !cfg.Refresh {
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	if len(cfg.Prefixes) == 0 {
-		cfg.Prefixes = []string{"/spanner/docs/"}
+	apiKey := os.Getenv("DEVELOPERKNOWLEDGE_API_KEY")
+	if apiKey == "" {
+		fmt.Fprintln(os.Stderr, "Error: DEVELOPERKNOWLEDGE_API_KEY is not set")
+		os.Exit(1)
 	}
+	cfg.APIKey = apiKey
 
 	app := &MirrorApp{
 		cfg:           cfg,
@@ -144,7 +158,6 @@ func main() {
 		tokens:        cfg.QuotaPerMinute,
 		lastRefill:    time.Now(),
 	}
-	app.cfg.APIKey = apiKey
 
 	if err := app.Run(seeds); err != nil {
 		fmt.Fprintf(os.Stderr, "Fatal Error: %v\n", err)
@@ -379,7 +392,7 @@ func (a *MirrorApp) resolveAndNormalize(link, basePath string) string {
 		rel = path.Join(path.Dir(basePath), rel)
 	}
 	rel = strings.Split(rel, "#")[0]
-	return "https://cloud.google.com" + rel
+	return "https://docs.cloud.google.com" + rel
 }
 
 func (a *MirrorApp) matchesAnyPrefix(u string) bool {
@@ -551,7 +564,7 @@ func (a *MirrorApp) saveDoc(doc Document) {
 	content := strings.TrimRight(doc.Content, " \t\r\n") + "\n"
 	os.WriteFile(fullPath, []byte(content), 0644)
 	
-	u := "https://cloud.google.com/" + strings.TrimPrefix(relPath, "docs.cloud.google.com/")
+	u := "https://docs.cloud.google.com/" + strings.TrimPrefix(relPath, "docs.cloud.google.com/")
 	a.processedURLs[u] = true
 }
 
