@@ -47,6 +47,7 @@ type Config struct {
 	MetadataFile   string        `toml:"metadata_file"`
 	Recursive      bool          `toml:"recursive"`
 	Refresh        bool          `toml:"refresh"`
+	Discovery      bool          `toml:"discovery"`
 	Prefixes       []string      `toml:"prefixes"`
 	Seeds          []string      `toml:"seeds"`
 	QuotaPerMinute float64       `toml:"qpm"`
@@ -60,9 +61,10 @@ func DefaultConfig() *Config {
 		MetadataFile:   "metadata.yaml",
 		Recursive:      false,
 		Refresh:        false,
+		Discovery:      true, // Default to HTML discovery
 		Prefixes:       []string{"/spanner/docs/"},
-		QuotaPerMinute: 100.0,
-		QuotaWait:      65 * time.Second,
+		QuotaPerMinute: 50.0, // Safer default (half of the 100 QPM hard limit)
+		QuotaWait:      70 * time.Second, // Safety buffer for window reset
 	}
 }
 
@@ -111,13 +113,14 @@ func main() {
 	// 3. Define real flags with current cfg as defaults
 	var prefixes stringSlice
 	flag.StringVar(&cfg.DocsDir, "docs", cfg.DocsDir, "Output directory for documents")
-	flag.StringVar(&cfg.LogDir, "logs", cfg.LogDir, "Directory for log files (urls.txt, redirects.txt, failed.txt)")
+	flag.StringVar(&cfg.LogDir, "logs", cfg.LogDir, "Directory for log files")
 	flag.StringVar(&cfg.MetadataFile, "metadata", cfg.MetadataFile, "Path to metadata summary file")
 	flag.BoolVar(&cfg.Recursive, "r", cfg.Recursive, "Recursive discovery from Markdown content")
 	flag.BoolVar(&cfg.Refresh, "f", cfg.Refresh, "Refresh existing documents")
-	flag.Float64Var(&cfg.QuotaPerMinute, "qpm", cfg.QuotaPerMinute, "Quota per minute (requests per minute)")
+	flag.BoolVar(&cfg.Discovery, "discovery", cfg.Discovery, "Discover more links from HTML navigation")
+	flag.Float64Var(&cfg.QuotaPerMinute, "qpm", cfg.QuotaPerMinute, "Quota per minute")
 	flag.DurationVar(&cfg.QuotaWait, "qw", cfg.QuotaWait, "Wait duration when quota is exceeded")
-	flag.Var(&prefixes, "prefix", "Path prefix(es) to mirror (overrides config if provided).")
+	flag.Var(&prefixes, "prefix", "Path prefix(es) to mirror")
 	
 	_ = flag.String("config", *configPath, "Path to TOML configuration file")
 
@@ -127,7 +130,6 @@ func main() {
 	}
 	flag.Parse()
 
-	// Flags override TOML for slices
 	if len(prefixes) > 0 {
 		cfg.Prefixes = prefixes
 	}
@@ -169,24 +171,28 @@ func (a *MirrorApp) Run(seeds []string) error {
 		targetURLs[s] = true
 	}
 
-	fmt.Println("--- Step 1: Finding Islands (devsite-tabs-wrapper) ---")
-	var islands []string
-	for _, s := range seeds {
-		found := a.fetchAndExtractLinks(s, []string{"devsite-tabs-wrapper"})
-		islands = append(islands, found...)
-	}
-	islands = deduplicate(islands)
-	for _, island := range islands {
-		targetURLs[island] = true
-	}
-
-	fmt.Println("--- Step 2: Collecting Pages (devsite-nav-list) ---")
-	searchRoots := deduplicate(append(seeds, islands...))
-	for _, root := range searchRoots {
-		pages := a.fetchAndExtractLinks(root, []string{"devsite-nav-list"})
-		for _, p := range pages {
-			targetURLs[p] = true
+	if a.cfg.Discovery {
+		fmt.Println("--- Step 1: Finding Islands (devsite-tabs-wrapper) ---")
+		var islands []string
+		for _, s := range seeds {
+			found := a.fetchAndExtractLinks(s, []string{"devsite-tabs-wrapper"})
+			islands = append(islands, found...)
 		}
+		islands = deduplicate(islands)
+		for _, island := range islands {
+			targetURLs[island] = true
+		}
+
+		fmt.Println("--- Step 2: Collecting Pages (devsite-nav-list) ---")
+		searchRoots := deduplicate(append(seeds, islands...))
+		for _, root := range searchRoots {
+			pages := a.fetchAndExtractLinks(root, []string{"devsite-nav-list"})
+			for _, p := range pages {
+				targetURLs[p] = true
+			}
+		}
+	} else {
+		fmt.Println("--- Skipping HTML discovery (Direct API Mirroring) ---")
 	}
 
 	fmt.Printf("--- Phase 3: API Mirroring (%d unique URLs identified) ---\n", len(targetURLs))
