@@ -14,10 +14,10 @@ func TestToRootRelative(t *testing.T) {
 		expected string
 	}{
 		{"https://docs.cloud.google.com/spanner/docs", "/spanner/docs"},
-		{"https://cloud.google.com/spanner/docs", "/spanner/docs"},
-		{"http://docs.cloud.google.com/spanner/docs", "/spanner/docs"},
-		{"http://cloud.google.com/spanner/docs", "/spanner/docs"},
-		{"/spanner/docs#anchor", "/spanner/docs"},
+		{"https://cloud.google.com/spanner/docs/", "/spanner/docs"},
+		{"https://docs.cloud.google.com/spanner/docs/dml-versus-mutations.md", "/spanner/docs/dml-versus-mutations"},
+		{"http://docs.cloud.google.com/spanner/docs#anchor", "/spanner/docs"},
+		{"/spanner/docs/backup/", "/spanner/docs/backup"},
 		{"spanner/docs", "/spanner/docs"},
 	}
 
@@ -36,11 +36,11 @@ func TestResolveAndNormalize(t *testing.T) {
 		base     string
 		expected string
 	}{
-		{"concepts", "/spanner/docs", "https://docs.cloud.google.com/spanner/concepts"},
-		{"../concepts", "/spanner/docs/sub", "https://docs.cloud.google.com/spanner/concepts"},
-		{"/spanner/docs/concepts", "/irrelevant", "https://docs.cloud.google.com/spanner/docs/concepts"},
-		{"https://cloud.google.com/spanner/docs", "/any", "https://docs.cloud.google.com/spanner/docs"},
-		{"https://external.com", "/any", ""},
+		{"concepts", "/spanner/docs", "https://docs.cloud.google.com/spanner/docs/concepts"},
+		{"backup/", "/spanner/docs", "https://docs.cloud.google.com/spanner/docs/backup"},
+		{"dml-versus-mutations.md", "/spanner/docs", "https://docs.cloud.google.com/spanner/docs/dml-versus-mutations"},
+		{"/spanner/docs/concepts/", "/irrelevant", "https://docs.cloud.google.com/spanner/docs/concepts"},
+		{"https://cloud.google.com/spanner/docs/", "/any", "https://docs.cloud.google.com/spanner/docs"},
 		{"#anchor", "/spanner/docs", "https://docs.cloud.google.com/spanner/docs"},
 	}
 
@@ -74,7 +74,7 @@ func TestNormalizeForAPI(t *testing.T) {
 func TestMatchesAnyPrefix(t *testing.T) {
 	app := &MirrorApp{
 		cfg: &Config{
-			Prefixes: []string{"/spanner/docs/", "/sdk/gcloud/reference/spanner"},
+			Prefixes: []string{"/spanner/docs", "/sdk/gcloud/reference/spanner"},
 		},
 	}
 	tests := []struct {

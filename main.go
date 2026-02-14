@@ -381,21 +381,25 @@ func (a *MirrorApp) discoverLinksFromMirror() []string {
 }
 
 func (a *MirrorApp) resolveAndNormalize(link, basePath string) string {
-	link = strings.Split(link, "#")[0]
-	if link == "" {
-		return "https://docs.cloud.google.com" + basePath
-	}
 	if strings.Contains(link, "://") && !strings.Contains(link, "cloud.google.com") {
 		return ""
 	}
+	
+	// Handle fragments
+	link = strings.Split(link, "#")[0]
+	if link == "" {
+		return "https://docs.cloud.google.com" + a.toRootRelative(basePath)
+	}
+
 	rel := link
 	if strings.Contains(rel, "://") {
 		rel = a.toRootRelative(rel)
 	}
+	
 	if !strings.HasPrefix(rel, "/") {
-		rel = path.Join(path.Dir(basePath), rel)
+		rel = path.Join(basePath, rel)
 	}
-	return "https://docs.cloud.google.com" + rel
+	return "https://docs.cloud.google.com" + a.toRootRelative(rel)
 }
 
 func (a *MirrorApp) matchesAnyPrefix(u string) bool {
@@ -414,10 +418,13 @@ func (a *MirrorApp) toRootRelative(u string) string {
 	u = strings.TrimPrefix(u, "https://cloud.google.com")
 	u = strings.TrimPrefix(u, "http://docs.cloud.google.com")
 	u = strings.TrimPrefix(u, "http://cloud.google.com")
-	if !strings.HasPrefix(u, "/") {
-		u = "/" + u
+	u = strings.Split(u, "#")[0]
+	u = strings.TrimSuffix(u, ".md")
+	u = path.Clean("/" + u)
+	if u == "." {
+		u = "/"
 	}
-	return strings.Split(u, "#")[0]
+	return u
 }
 
 func (a *MirrorApp) extractLinksFromMarkdown(source []byte) []string {
