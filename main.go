@@ -45,6 +45,7 @@ type Config struct {
 	MasterList     string
 	RedirectLog    string
 	FailedLog      string
+	MetadataFile   string
 	Recursive      bool
 	Refresh        bool
 	Prefixes       []string
@@ -81,8 +82,9 @@ func main() {
 	recursive := flag.Bool("r", false, "Recursive discovery from Markdown content")
 	refresh := flag.Bool("f", false, "Refresh existing documents")
 	docsDir := flag.String("docs", "docs", "Output directory for documents")
+	metadata := flag.String("metadata", "metadata.yaml", "Path to metadata summary file")
 	qpm := flag.Float64("qpm", 100.0, "Quota per minute (requests per minute)")
-	qw := flag.Duration("qw", 65*time.Second, "Wait duration when quota is exceeded (e.g. 65s, 2m)")
+	qw := flag.Duration("qw", 65*time.Second, "Wait duration when quota is exceeded")
 	
 	var prefixes stringSlice
 	flag.Var(&prefixes, "prefix", "Path prefix(es) to mirror (comma-separated or multiple flags).")
@@ -116,6 +118,7 @@ func main() {
 			MasterList:    "urls.txt",
 			RedirectLog:    "redirect_cache.txt",
 			FailedLog:      "failed_urls.txt",
+			MetadataFile:   *metadata,
 			Recursive:      *recursive,
 			Refresh:        *refresh,
 			Prefixes:       prefixes,
@@ -206,6 +209,36 @@ func (a *MirrorApp) Run(seeds []string) error {
 
 	a.saveMetadata()
 	return nil
+}
+
+func (a *MirrorApp) saveMetadata() {
+	saver := func(p string, data map[string]bool) {
+		var l []string
+		for k := range data { l = append(l, k) }
+		sort.Strings(l)
+		os.WriteFile(p, []byte(strings.Join(l, "\n")+"\n"), 0644)
+	}
+	
+	saver(a.cfg.MasterList, a.processedURLs)
+	saver(a.cfg.FailedLog, a.failedURLs)
+	
+	var rs []string
+	for k, v := range a.redirects { rs = append(rs, k+" "+v) }
+	sort.Strings(rs)
+	os.WriteFile(a.cfg.RedirectLog, []byte(strings.Join(rs, "\n")+"\n"), 0644)
+
+	fmt.Println("--- Updating metadata.yaml ---")
+	fileCount := 0
+	filepath.Walk(a.cfg.DocsDir, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() && filepath.Ext(info.Name()) == ".md" {
+			fileCount++
+		}
+		return nil
+	})
+
+	metadata := fmt.Sprintf("file_count: %d\nlast_sync: %s\n", 
+		fileCount, time.Now().UTC().Format(time.RFC3339))
+	os.WriteFile(a.cfg.MetadataFile, []byte(metadata), 0644)
 }
 
 func (a *MirrorApp) isProcessedSession(u string) bool {
@@ -473,11 +506,11 @@ func (a *MirrorApp) fetchDocs(urls []string) ([]Document, *APIError) {
 	}
 
 	if res.Error != nil {
-		apiErr := &APIError{}
-		apiErr.Error.Code = res.Error.Code
-		apiErr.Error.Message = res.Error.Message
-		apiErr.Error.Status = res.Error.Status
-		return nil, apiErr
+		e := &APIError{}
+		e.Error.Code = res.Error.Code
+		e.Error.Message = res.Error.Message
+		e.Error.Status = res.Error.Status
+		return nil, e
 	}
 	
 	if resp.StatusCode != 200 {
@@ -547,21 +580,6 @@ func (a *MirrorApp) loadMasterListOnly() {
 			a.processedURLs[t] = true
 		}
 	}
-}
-
-func (a *MirrorApp) saveMetadata() {
-	saver := func(p string, data map[string]bool) {
-		var l []string
-		for k := range data { l = append(l, k) }
-		sort.Strings(l)
-		os.WriteFile(p, []byte(strings.Join(l, "\n")+"\n"), 0644)
-	}
-	saver(a.cfg.MasterList, a.processedURLs)
-	saver(a.cfg.FailedLog, a.failedURLs)
-	var rs []string
-	for k, v := range a.redirects { rs = append(rs, k+" "+v) }
-	sort.Strings(rs)
-	os.WriteFile(a.cfg.RedirectLog, []byte(strings.Join(rs, "\n")+"\n"), 0644)
 }
 
 func deduplicate(s []string) []string {
