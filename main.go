@@ -26,12 +26,28 @@ const (
 	maxConsecutiveErrors = 3
 )
 
+type stringSlice []string
+
+func (s *stringSlice) String() string {
+	return strings.Join(*s, ", ")
+}
+
+func (s *stringSlice) Set(value string) error {
+	for _, v := range strings.Split(value, ",") {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			*s = append(*s, v)
+		}
+	}
+	return nil
+}
+
 type Config struct {
 	APIKey         string
 	DocsDir        string
 	MasterList     string
-	RedirectLog    string // Renamed from Cache to Log
-	FailedLog      string // Renamed from Cache to Log
+	RedirectLog    string
+	FailedLog      string
 	Recursive      bool
 	Refresh        bool
 	Prefixes       []string
@@ -63,24 +79,26 @@ func main() {
 	recursive := flag.Bool("r", false, "Recursive discovery from Markdown content")
 	refresh := flag.Bool("f", false, "Refresh existing documents")
 	docsDir := flag.String("docs", "docs", "Output directory for documents")
+	
+	var prefixes stringSlice
+	flag.Var(&prefixes, "prefix", "Path prefix(es) to mirror (comma-separated or multiple flags).")
+	
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] <seed_url> [<seed_url> ...]\n", os.Args[0])
+		flag.PrintDefaults()
+	}
 	flag.Parse()
+
+	seeds := flag.Args()
+	if len(seeds) == 0 && !*refresh {
+		flag.Usage()
+		os.Exit(1)
+	}
 
 	apiKey := os.Getenv("DEVELOPERKNOWLEDGE_API_KEY")
 	if apiKey == "" {
 		fmt.Fprintln(os.Stderr, "Error: DEVELOPERKNOWLEDGE_API_KEY is not set")
 		os.Exit(1)
-	}
-
-	args := flag.Args()
-	var prefixes []string
-	var initialSeeds []string
-
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "/") {
-			prefixes = append(prefixes, arg)
-		} else if strings.HasPrefix(arg, "http") {
-			initialSeeds = append(initialSeeds, arg)
-		}
 	}
 
 	if len(prefixes) == 0 {
@@ -92,7 +110,7 @@ func main() {
 			APIKey:        apiKey,
 			DocsDir:       *docsDir,
 			MasterList:    "urls.txt",
-			RedirectLog:   "redirect_cache.txt", // Keeping filenames for now
+			RedirectLog:   "redirect_cache.txt",
 			FailedLog:     "failed_urls.txt",
 			Recursive:     *recursive,
 			Refresh:       *refresh,
@@ -104,7 +122,7 @@ func main() {
 		mdParser:      goldmark.New(),
 	}
 
-	if err := app.Run(initialSeeds); err != nil {
+	if err := app.Run(seeds); err != nil {
 		fmt.Fprintf(os.Stderr, "Fatal Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -113,7 +131,6 @@ func main() {
 func (a *MirrorApp) Run(seeds []string) error {
 	a.loadMasterListOnly()
 
-	// Step 1 & 2: HTML Discovery
 	targetURLs := make(map[string]bool)
 	for _, s := range seeds {
 		targetURLs[s] = true
@@ -185,7 +202,6 @@ func (a *MirrorApp) Run(seeds []string) error {
 	return nil
 }
 
-// isProcessedSession checks if URL was handled IN THIS RUN or is already in master list
 func (a *MirrorApp) isProcessedSession(u string) bool {
 	return a.processedURLs[u] || a.failedURLs[u] || a.redirects[u] != ""
 }
