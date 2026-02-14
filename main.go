@@ -30,8 +30,8 @@ type Config struct {
 	APIKey         string
 	DocsDir        string
 	MasterList     string
-	RedirectCache  string
-	FailedCache    string
+	RedirectLog    string // Renamed from Cache to Log
+	FailedLog      string // Renamed from Cache to Log
 	Recursive      bool
 	Refresh        bool
 	Prefixes       []string
@@ -92,8 +92,8 @@ func main() {
 			APIKey:        apiKey,
 			DocsDir:       *docsDir,
 			MasterList:    "urls.txt",
-			RedirectCache: "redirect_cache.txt",
-			FailedCache:   "failed_urls.txt",
+			RedirectLog:   "redirect_cache.txt", // Keeping filenames for now
+			FailedLog:     "failed_urls.txt",
 			Recursive:     *recursive,
 			Refresh:       *refresh,
 			Prefixes:      prefixes,
@@ -111,15 +111,14 @@ func main() {
 }
 
 func (a *MirrorApp) Run(seeds []string) error {
-	a.loadMetadata()
+	a.loadMasterListOnly()
 
-	// Initial set of URLs to mirror
+	// Step 1 & 2: HTML Discovery
 	targetURLs := make(map[string]bool)
 	for _, s := range seeds {
 		targetURLs[s] = true
 	}
 
-	// Step 1: Discover "Islands" from Navbar
 	fmt.Println("--- Step 1: Finding Islands (devsite-tabs-wrapper) ---")
 	var islands []string
 	for _, s := range seeds {
@@ -131,9 +130,7 @@ func (a *MirrorApp) Run(seeds []string) error {
 		targetURLs[island] = true
 	}
 
-	// Step 2: Discover "Pages" from Sidebars of all islands
 	fmt.Println("--- Step 2: Collecting Pages (devsite-nav-list) ---")
-	// Process both original seeds and discovered islands for their sidebars
 	searchRoots := deduplicate(append(seeds, islands...))
 	for _, root := range searchRoots {
 		pages := a.fetchAndExtractLinks(root, []string{"devsite-nav-list"})
@@ -148,9 +145,8 @@ func (a *MirrorApp) Run(seeds []string) error {
 	for {
 		var queue []string
 		if depth == 1 {
-			// Initial queue from Step 1 & 2
 			for u := range targetURLs {
-				if !a.isProcessed(u) && a.matchesAnyPrefix(u) {
+				if !a.isProcessedSession(u) && a.matchesAnyPrefix(u) {
 					queue = append(queue, u)
 				}
 			}
@@ -164,7 +160,6 @@ func (a *MirrorApp) Run(seeds []string) error {
 			}
 		}
 
-		// Standard discovery from local Markdown (if recursive mode is on)
 		if a.cfg.Recursive {
 			discoveredFromMD := a.discoverLinksFromMirror()
 			queue = append(queue, discoveredFromMD...)
@@ -188,6 +183,11 @@ func (a *MirrorApp) Run(seeds []string) error {
 
 	a.saveMetadata()
 	return nil
+}
+
+// isProcessedSession checks if URL was handled IN THIS RUN or is already in master list
+func (a *MirrorApp) isProcessedSession(u string) bool {
+	return a.processedURLs[u] || a.failedURLs[u] || a.redirects[u] != ""
 }
 
 func (a *MirrorApp) fetchAndExtractLinks(u string, targetClasses []string) []string {
@@ -216,7 +216,7 @@ func (a *MirrorApp) extractLinksWithClassFilter(r io.Reader, targetClasses []str
 	var links []string
 	z := html.NewTokenizer(r)
 	depth := 0
-	inTargetDepth := 0 // Depth where we entered a target class element
+	inTargetDepth := 0
 
 	for {
 		tt := z.Next()
@@ -226,8 +226,6 @@ func (a *MirrorApp) extractLinksWithClassFilter(r io.Reader, targetClasses []str
 		case html.StartTagToken:
 			depth++
 			t := z.Token()
-			
-			// Check if this tag starts a target container
 			if inTargetDepth == 0 {
 				for _, attr := range t.Attr {
 					if attr.Key == "class" {
@@ -243,8 +241,6 @@ func (a *MirrorApp) extractLinksWithClassFilter(r io.Reader, targetClasses []str
 					}
 				}
 			}
-
-			// If inside target, collect links
 			if inTargetDepth > 0 && t.Data == "a" {
 				for _, attr := range t.Attr {
 					if attr.Key == "href" {
@@ -268,7 +264,6 @@ func (a *MirrorApp) discoverLinksFromMirror() []string {
 		if err != nil || info.IsDir() || filepath.Ext(fpath) != ".md" {
 			return nil
 		}
-
 		relToDocs, _ := filepath.Rel(a.cfg.DocsDir, fpath)
 		relToDocs = strings.TrimSuffix(relToDocs, ".md")
 		basePath := "/" + strings.TrimPrefix(relToDocs, "docs.cloud.google.com/")
@@ -278,7 +273,7 @@ func (a *MirrorApp) discoverLinksFromMirror() []string {
 		
 		for _, l := range links {
 			normalized := a.resolveAndNormalize(l, basePath)
-			if normalized != "" && !a.isProcessed(normalized) && a.matchesAnyPrefix(normalized) {
+			if normalized != "" && !a.isProcessedSession(normalized) && a.matchesAnyPrefix(normalized) {
 				allDiscovered = append(allDiscovered, normalized)
 			}
 		}
@@ -344,10 +339,6 @@ func (a *MirrorApp) extractLinksFromMarkdown(source []byte) []string {
 		return ast.WalkContinue, nil
 	})
 	return links
-}
-
-func (a *MirrorApp) isProcessed(u string) bool {
-	return a.processedURLs[u] || a.failedURLs[u] || a.redirects[u] != ""
 }
 
 func (a *MirrorApp) processQueue(depth int, queue []string) error {
@@ -466,25 +457,16 @@ func (a *MirrorApp) handleLeafFailure(u string) error {
 	return nil
 }
 
-func (a *MirrorApp) loadMetadata() {
-	loader := func(p string, target map[string]bool) {
-		f, _ := os.Open(p)
-		if f == nil { return }
-		defer f.Close()
-		s := bufio.NewScanner(f)
-		for s.Scan() {
-			if t := strings.TrimSpace(s.Text()); t != "" { target[t] = true }
-		}
+func (a *MirrorApp) loadMasterListOnly() {
+	f, _ := os.Open(a.cfg.MasterList)
+	if f == nil {
+		return
 	}
-	loader(a.cfg.MasterList, a.processedURLs)
-	loader(a.cfg.FailedCache, a.failedURLs)
-	f, _ := os.Open(a.cfg.RedirectCache)
-	if f != nil {
-		defer f.Close()
-		s := bufio.NewScanner(f)
-		for s.Scan() {
-			p := strings.Fields(s.Text())
-			if len(p) >= 2 { a.redirects[p[0]] = p[1] }
+	defer f.Close()
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		if t := strings.TrimSpace(s.Text()); t != "" {
+			a.processedURLs[t] = true
 		}
 	}
 }
@@ -497,11 +479,11 @@ func (a *MirrorApp) saveMetadata() {
 		os.WriteFile(p, []byte(strings.Join(l, "\n")+"\n"), 0644)
 	}
 	saver(a.cfg.MasterList, a.processedURLs)
-	saver(a.cfg.FailedCache, a.failedURLs)
+	saver(a.cfg.FailedLog, a.failedURLs)
 	var rs []string
 	for k, v := range a.redirects { rs = append(rs, k+" "+v) }
 	sort.Strings(rs)
-	os.WriteFile(a.cfg.RedirectCache, []byte(strings.Join(rs, "\n")+"\n"), 0644)
+	os.WriteFile(a.cfg.RedirectLog, []byte(strings.Join(rs, "\n")+"\n"), 0644)
 }
 
 func deduplicate(s []string) []string {

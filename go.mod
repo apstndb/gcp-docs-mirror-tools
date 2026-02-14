@@ -1,4 +1,4 @@
-module github.com/cloudspannerecosystem/gcp-docs-mirror-tools-go
+module github.com/apstndb/gcp-docs-mirror-tools
 
 go 1.24.13
 
