@@ -43,9 +43,7 @@ func (s *stringSlice) Set(value string) error {
 type Config struct {
 	APIKey         string        `toml:"-"`
 	DocsDir        string        `toml:"docs_dir"`
-	MasterList     string        `toml:"master_list"`
-	RedirectLog    string        `toml:"redirect_log"`
-	FailedLog      string        `toml:"failed_log"`
+	LogDir         string        `toml:"log_dir"`
 	MetadataFile   string        `toml:"metadata_file"`
 	Recursive      bool          `toml:"recursive"`
 	Refresh        bool          `toml:"refresh"`
@@ -58,9 +56,7 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		DocsDir:        "docs",
-		MasterList:     "urls.txt",
-		RedirectLog:    "redirect_cache.txt",
-		FailedLog:      "failed_urls.txt",
+		LogDir:         "logs",
 		MetadataFile:   "metadata.yaml",
 		Recursive:      false,
 		Refresh:        false,
@@ -115,7 +111,7 @@ func main() {
 	// 3. Define real flags with current cfg as defaults
 	var prefixes stringSlice
 	flag.StringVar(&cfg.DocsDir, "docs", cfg.DocsDir, "Output directory for documents")
-	flag.StringVar(&cfg.MasterList, "master-list", cfg.MasterList, "Master list of processed URLs")
+	flag.StringVar(&cfg.LogDir, "logs", cfg.LogDir, "Directory for log files (urls.txt, redirects.txt, failed.txt)")
 	flag.StringVar(&cfg.MetadataFile, "metadata", cfg.MetadataFile, "Path to metadata summary file")
 	flag.BoolVar(&cfg.Recursive, "r", cfg.Recursive, "Recursive discovery from Markdown content")
 	flag.BoolVar(&cfg.Refresh, "f", cfg.Refresh, "Refresh existing documents")
@@ -238,20 +234,29 @@ func (a *MirrorApp) Run(seeds []string) error {
 }
 
 func (a *MirrorApp) saveMetadata() {
-	saver := func(p string, data map[string]bool) {
+	if a.cfg.LogDir != "" {
+		os.MkdirAll(a.cfg.LogDir, 0755)
+	}
+
+	saver := func(filename string, data map[string]bool) {
+		if a.cfg.LogDir == "" {
+			return
+		}
 		var l []string
 		for k := range data { l = append(l, k) }
 		sort.Strings(l)
-		os.WriteFile(p, []byte(strings.Join(l, "\n")+"\n"), 0644)
+		os.WriteFile(filepath.Join(a.cfg.LogDir, filename), []byte(strings.Join(l, "\n")+"\n"), 0644)
 	}
 	
-	saver(a.cfg.MasterList, a.processedURLs)
-	saver(a.cfg.FailedLog, a.failedURLs)
+	saver("urls.txt", a.processedURLs)
+	saver("failed.txt", a.failedURLs)
 	
 	var rs []string
 	for k, v := range a.redirects { rs = append(rs, k+" "+v) }
 	sort.Strings(rs)
-	os.WriteFile(a.cfg.RedirectLog, []byte(strings.Join(rs, "\n")+"\n"), 0644)
+	if a.cfg.LogDir != "" {
+		os.WriteFile(filepath.Join(a.cfg.LogDir, "redirects.txt"), []byte(strings.Join(rs, "\n")+"\n"), 0644)
+	}
 
 	fmt.Println("--- Updating metadata.yaml ---")
 	fileCount := 0
@@ -609,7 +614,10 @@ func (a *MirrorApp) handleLeafFailure(u string) error {
 }
 
 func (a *MirrorApp) loadMasterListOnly() {
-	f, _ := os.Open(a.cfg.MasterList)
+	if a.cfg.LogDir == "" {
+		return
+	}
+	f, _ := os.Open(filepath.Join(a.cfg.LogDir, "urls.txt"))
 	if f == nil {
 		return
 	}
