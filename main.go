@@ -49,6 +49,7 @@ type Config struct {
 	Refresh        bool
 	Prefixes       []string
 	QuotaPerMinute float64
+	QuotaWait      time.Duration
 }
 
 type MirrorApp struct {
@@ -81,6 +82,7 @@ func main() {
 	refresh := flag.Bool("f", false, "Refresh existing documents")
 	docsDir := flag.String("docs", "docs", "Output directory for documents")
 	qpm := flag.Float64("qpm", 100.0, "Quota per minute (requests per minute)")
+	qw := flag.Duration("qw", 65*time.Second, "Wait duration when quota is exceeded (e.g. 65s, 2m)")
 	
 	var prefixes stringSlice
 	flag.Var(&prefixes, "prefix", "Path prefix(es) to mirror (comma-separated or multiple flags).")
@@ -110,20 +112,21 @@ func main() {
 	app := &MirrorApp{
 		cfg: &Config{
 			APIKey:         apiKey,
-			DocsDir:        *docsDir,
-			MasterList:     "urls.txt",
+			DocsDir:       *docsDir,
+			MasterList:    "urls.txt",
 			RedirectLog:    "redirect_cache.txt",
 			FailedLog:      "failed_urls.txt",
 			Recursive:      *recursive,
 			Refresh:        *refresh,
 			Prefixes:       prefixes,
 			QuotaPerMinute: *qpm,
+			QuotaWait:      *qw,
 		},
 		processedURLs: make(map[string]bool),
 		redirects:     make(map[string]string),
 		failedURLs:    make(map[string]bool),
 		mdParser:      goldmark.New(),
-		tokens:        *qpm, // Start full
+		tokens:        *qpm,
 		lastRefill:    time.Now(),
 	}
 
@@ -420,9 +423,8 @@ func (a *MirrorApp) fetchDocsWithRetry(urls []string) ([]Document, *APIError) {
 			return docs, nil
 		}
 		if apiErr.Error.Code == 429 || apiErr.Error.Status == "RESOURCE_EXHAUSTED" {
-			waitTime := 65 * time.Second
-			fmt.Printf("\n  [Quota Exceeded] Waiting %v for window reset (%d/5)... ", waitTime, i+1)
-			time.Sleep(waitTime)
+			fmt.Printf("\n  [Quota Exceeded] Waiting %v for window reset (%d/5)... ", a.cfg.QuotaWait, i+1)
+			time.Sleep(a.cfg.QuotaWait)
 			a.tokens = a.cfg.QuotaPerMinute
 			a.lastRefill = time.Now()
 			continue
@@ -441,18 +443,21 @@ func (a *MirrorApp) fetchDocs(urls []string) ([]Document, *APIError) {
 	reqURL := "https://developerknowledge.googleapis.com/v1alpha/documents:batchGet?" + v.Encode()
 	req, _ := http.NewRequest("GET", reqURL, nil)
 	req.Header.Set("X-Goog-Api-Key", a.cfg.APIKey)
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, makeSimpleError(err.Error())
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode == 429 {
-		e := &APIError{}
-		e.Error.Code = 429
-		e.Error.Message = "Quota exceeded"
-		e.Error.Status = "RESOURCE_EXHAUSTED"
-		return nil, e
+		apiErr := &APIError{}
+		apiErr.Error.Code = 429
+		apiErr.Error.Message = "Quota exceeded"
+		apiErr.Error.Status = "RESOURCE_EXHAUSTED"
+		return nil, apiErr
 	}
+
 	var res struct {
 		Documents []Document `json:"documents"`
 		Error     *struct {
@@ -461,20 +466,24 @@ func (a *MirrorApp) fetchDocs(urls []string) ([]Document, *APIError) {
 			Status  string `json:"status"`
 		} `json:"error"`
 	}
+	
 	body, _ := io.ReadAll(resp.Body)
 	if err := json.Unmarshal(body, &res); err != nil {
 		return nil, makeSimpleError(fmt.Sprintf("JSON parse error: %v (Status: %d)", err, resp.StatusCode))
 	}
+
 	if res.Error != nil {
-		e := &APIError{}
-		e.Error.Code = res.Error.Code
-		e.Error.Message = res.Error.Message
-		e.Error.Status = res.Error.Status
-		return nil, e
+		apiErr := &APIError{}
+		apiErr.Error.Code = res.Error.Code
+		apiErr.Error.Message = res.Error.Message
+		apiErr.Error.Status = res.Error.Status
+		return nil, apiErr
 	}
+	
 	if resp.StatusCode != 200 {
 		return nil, makeSimpleError(fmt.Sprintf("HTTP Error %d", resp.StatusCode))
 	}
+
 	return res.Documents, nil
 }
 
