@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -374,59 +375,59 @@ func (a *MirrorApp) Run(seeds []string) error {
 		a.loadMasterListOnly()
 	}
 
+	// shared work counter to track all enqueued tasks including recursive ones
+	var activeWork sync.WaitGroup
+
 	// Start URL Processor (Consumer)
 	processDone := make(chan error, 1)
 	go func() {
-		processDone <- a.processStream()
+		processDone <- a.processStream(&activeWork)
 	}()
 
 	// Discovery 0: Sitemaps
 	if len(a.cfg.Sitemaps) > 0 {
-		a.discoveryWG.Add(1)
-		go func() {
-			defer a.discoveryWG.Done()
-			a.DiscoverFromSitemaps(a.cfg.Sitemaps)
-		}()
+		a.discoveryWG.Go(func() {
+			a.DiscoverFromSitemaps(a.cfg.Sitemaps, &activeWork)
+		})
 	}
 
 	// Discovery 1: Seeds
 	for _, s := range seeds {
-		a.enqueue(s)
+		a.enqueue(s, &activeWork)
 	}
 
 	// Discovery 2: HTML Scan (Islands & Nav List)
 	if a.cfg.Discovery {
-		a.discoveryWG.Add(1)
-		go func() {
-			defer a.discoveryWG.Done()
+		a.discoveryWG.Go(func() {
 			var islands []string
 			for _, s := range seeds {
 				found := a.fetchAndExtractLinks(s, []string{"devsite-tabs-wrapper"})
 				islands = append(islands, found...)
 			}
-			islands = deduplicate(islands)
+			slices.Sort(islands)
+			islands = slices.Compact(islands)
 			for _, island := range islands {
-				a.enqueue(island)
+				a.enqueue(island, &activeWork)
 			}
 
-			searchRoots := deduplicate(append(seeds, islands...))
+			searchRoots := append(seeds, islands...)
+			slices.Sort(searchRoots)
+			searchRoots = slices.Compact(searchRoots)
 			for _, root := range searchRoots {
 				pages := a.fetchAndExtractLinks(root, []string{"devsite-nav-list"})
 				for _, p := range pages {
-					a.enqueue(p)
+					a.enqueue(p, &activeWork)
 				}
 			}
-		}()
+		})
 	}
 
 	// Discovery 3: Local Mirror (Recursive)
 	if a.cfg.Recursive {
-		a.discoveryWG.Add(1)
-		go func() {
-			defer a.discoveryWG.Done()
+		a.discoveryWG.Go(func() {
 			discoveredFromMD := a.discoverLinksFromMirror()
-			a.enqueueBatch(discoveredFromMD)
-		}()
+			a.enqueueBatch(discoveredFromMD, &activeWork)
+		})
 	}
 
 	// Discovery 4: Refresh Mode
@@ -438,12 +439,13 @@ func (a *MirrorApp) Run(seeds []string) error {
 			existing = append(existing, u)
 		}
 		a.mu.Unlock()
-		a.enqueueBatch(existing)
+		a.enqueueBatch(existing, &activeWork)
 	}
 
-	// Close channel when all initial discoveries finish
+	// Close channel when all work (initial + recursive/redirects) finish
 	go func() {
 		a.discoveryWG.Wait()
+		activeWork.Wait()
 		close(a.queueChan)
 	}()
 
@@ -452,11 +454,11 @@ func (a *MirrorApp) Run(seeds []string) error {
 	return err
 }
 
-func (a *MirrorApp) enqueue(u string) {
-	a.enqueueBatch([]string{u})
+func (a *MirrorApp) enqueue(u string, wg *sync.WaitGroup) {
+	a.enqueueBatch([]string{u}, wg)
 }
 
-func (a *MirrorApp) enqueueBatch(urls []string) {
+func (a *MirrorApp) enqueueBatch(urls []string, wg *sync.WaitGroup) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	
@@ -478,18 +480,19 @@ func (a *MirrorApp) enqueueBatch(urls []string) {
 			continue
 		}
 		
+		wg.Add(1) // Increment work counter for each URL actually enqueued
 		a.queueChan <- u
 	}
 	atomic.AddInt32(&a.discoveredCount, discovered)
 	atomic.AddInt32(&a.skippedCount, skipped)
 }
 
-func (a *MirrorApp) processStream() error {
+func (a *MirrorApp) processStream(wg *sync.WaitGroup) error {
 	a.log("Phase 3: Pipelined API Mirroring")
 	
 	type batch []string
 	batches := make(chan batch)
-	var wg sync.WaitGroup
+	var workerWG sync.WaitGroup
 	numWorkers := 30 
 
 	var firstErr error
@@ -497,11 +500,9 @@ func (a *MirrorApp) processStream() error {
 
 	// Start Workers
 	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		workerWG.Go(func() {
 			for b := range batches {
-				err := a.processBatchRecursive(b)
+				err := a.processBatchRecursive(b, wg)
 				if err != nil {
 					errMu.Lock()
 					if firstErr == nil {
@@ -510,7 +511,7 @@ func (a *MirrorApp) processStream() error {
 					errMu.Unlock()
 				}
 			}
-		}()
+		})
 	}
 
 	// Collector: batch items from queueChan
@@ -526,7 +527,7 @@ func (a *MirrorApp) processStream() error {
 		batches <- currentBatch
 	}
 	close(batches)
-	wg.Wait()
+	workerWG.Wait()
 	a.log("Mirroring complete.")
 
 	return firstErr
@@ -756,7 +757,7 @@ func (a *MirrorApp) extractLinksFromMarkdown(source []byte) []string {
 	return links
 }
 
-func (a *MirrorApp) processBatchRecursive(urls []string) error {
+func (a *MirrorApp) processBatchRecursive(urls []string, wg *sync.WaitGroup) error {
 	if len(urls) == 0 {
 		return nil
 	}
@@ -784,6 +785,7 @@ func (a *MirrorApp) processBatchRecursive(urls []string) error {
 				a.failedURLs[u] = true
 				atomic.AddInt32(&a.failedCount, 1)
 			}
+			wg.Done() // URL processing finished (synced or missing)
 		}
 		a.mu.Unlock()
 		return nil
@@ -794,13 +796,13 @@ func (a *MirrorApp) processBatchRecursive(urls []string) error {
 		a.redirectWG.Add(1)
 		go func(u string) {
 			defer a.redirectWG.Done()
-			a.handleLeafFailure(u)
+			a.handleLeafFailure(u, wg)
 		}(urls[0])
 		return nil
 	}
 	mid := len(urls) / 2
-	a.processBatchRecursive(urls[:mid])
-	return a.processBatchRecursive(urls[mid:])
+	a.processBatchRecursive(urls[:mid], wg)
+	return a.processBatchRecursive(urls[mid:], wg)
 }
 
 func (a *MirrorApp) fetchDocsWithRetry(urls []string) ([]Document, *APIError) {
@@ -888,7 +890,7 @@ func (a *MirrorApp) normalizeForAPI(u string) string {
 	return "documents/" + name
 }
 
-func (a *MirrorApp) handleLeafFailure(u string) error {
+func (a *MirrorApp) handleLeafFailure(u string, wg *sync.WaitGroup) error {
 	curr := u
 	for i := 0; i < 10; i++ {
 		resp, err := a.noRedirectClient.Get(curr)
@@ -909,7 +911,7 @@ func (a *MirrorApp) handleLeafFailure(u string) error {
 		a.redirects[u] = curr
 		atomic.AddInt32(&a.redirectCount, 1)
 		a.mu.Unlock()
-		a.enqueue(curr)
+		a.enqueue(curr, wg)
 	} else {
 		a.mu.Lock()
 		a.failedURLs[u] = true
@@ -918,6 +920,7 @@ func (a *MirrorApp) handleLeafFailure(u string) error {
 		lpath := filepath.Join(a.cfg.DocsDir, strings.TrimPrefix(a.normalizeForAPI(u), "documents/") + ".md")
 		os.Remove(lpath)
 	}
+	wg.Done() // Original URL processing (which failed/redirected) is finished
 	return nil
 }
 
@@ -928,15 +931,6 @@ func (a *MirrorApp) loadMasterListOnly() {
 		a.processedURLs[k] = v
 	}
 	a.mu.Unlock()
-}
-
-func deduplicate(s []string) []string {
-	m := make(map[string]bool)
-	var res []string
-	for _, v := range s {
-		if !m[v] { m[v] = true; res = append(res, v) }
-	}
-	return res
 }
 
 func makeSimpleError(msg string) *APIError {

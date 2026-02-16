@@ -11,16 +11,16 @@ type locEntry struct {
 	Loc string `xml:"loc"`
 }
 
-func (a *MirrorApp) DiscoverFromSitemaps(sitemapURLs []string) {
+func (a *MirrorApp) DiscoverFromSitemaps(sitemapURLs []string, activeWork *sync.WaitGroup) {
 	a.log("--- Step 0: Sitemap Discovery (Pipelined) ---")
 	
-	var wg sync.WaitGroup
+	var sitemapWG sync.WaitGroup
 	// Limit concurrent sitemap fetches to avoid connection limits
 	sem := make(chan struct{}, 10)
 
 	var crawl func(string)
 	crawl = func(u string) {
-		defer wg.Done()
+		defer sitemapWG.Done()
 		
 		sem <- struct{}{}
 		defer func() { <-sem }()
@@ -51,8 +51,7 @@ func (a *MirrorApp) DiscoverFromSitemaps(sitemapURLs []string) {
 					var entry locEntry
 					if err := decoder.DecodeElement(&entry, &se); err == nil {
 						atomic.AddInt32(&a.sitemapTotal, 1)
-						wg.Add(1)
-						go crawl(entry.Loc)
+						sitemapWG.Go(func() { crawl(entry.Loc) })
 					}
 				} else if se.Name.Local == "url" {
 					var entry locEntry
@@ -64,7 +63,7 @@ func (a *MirrorApp) DiscoverFromSitemaps(sitemapURLs []string) {
 						if normalized != "" {
 							batch = append(batch, normalized)
 							if len(batch) >= 100 {
-								a.enqueueBatch(batch)
+								a.enqueueBatch(batch, activeWork)
 								count += len(batch)
 								batch = nil
 							}
@@ -74,7 +73,7 @@ func (a *MirrorApp) DiscoverFromSitemaps(sitemapURLs []string) {
 			}
 		}
 		if len(batch) > 0 {
-			a.enqueueBatch(batch)
+			a.enqueueBatch(batch, activeWork)
 			count += len(batch)
 		}
 		
@@ -86,10 +85,9 @@ func (a *MirrorApp) DiscoverFromSitemaps(sitemapURLs []string) {
 
 	for _, u := range sitemapURLs {
 		atomic.AddInt32(&a.sitemapTotal, 1)
-		wg.Add(1)
-		go crawl(u)
+		sitemapWG.Go(func() { crawl(u) })
 	}
 
-	wg.Wait()
+	sitemapWG.Wait()
 	a.log("Sitemap discovery complete.")
 }
