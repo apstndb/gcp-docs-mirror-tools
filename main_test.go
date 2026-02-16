@@ -179,7 +179,7 @@ func TestEnqueueBatch(t *testing.T) {
 			Prefixes: []string{"/allowed"},
 		},
 		processedURLs: make(map[string]bool),
-		failedURLs:    make(map[string]bool),
+		failedURLs:    make(map[string]int),
 		redirects:     make(map[string]string),
 		sessionQueued: make(map[string]bool),
 		queueChan:     make(chan string, 10),

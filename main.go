@@ -24,6 +24,7 @@ import (
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/text"
 	"golang.org/x/net/html"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -77,12 +78,12 @@ func DefaultConfig() *Config {
 		MetadataFile:   "metadata.yaml",
 		Recursive:      false,
 		Refresh:        false,
-		Discovery:      true, // Default to HTML discovery
+		Discovery:      true,
 		Prefixes:       []string{"/spanner/docs/"},
 		Sitemaps:       nil,
-		QuotaPerMinute: 50.0, // Safer default (half of the 100 QPM hard limit)
-		QuotaWait:      70 * time.Second, // Safety buffer for window reset
-		StallTimeout:   0, // Disabled by default
+		QuotaPerMinute: 50.0,
+		QuotaWait:      70 * time.Second,
+		StallTimeout:   0,
 	}
 }
 
@@ -101,8 +102,7 @@ func (s *DiskStorage) Save(docs ...Document) error {
 		relPath := strings.TrimPrefix(doc.Name, "documents/")
 		fullPath := filepath.Join(s.docsDir, relPath+".md")
 		os.MkdirAll(filepath.Dir(fullPath), 0755)
-
-		// Normalize trailing newline: Trim trailing whitespace and add exactly one newline.
+		// Normalize trailing newline
 		content := strings.TrimRight(doc.Content, " \t\r\n") + "\n"
 		if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
 			return err
@@ -135,19 +135,19 @@ type MirrorApp struct {
 	storage       Storage
 	processedURLs map[string]bool
 	redirects     map[string]string
-	failedURLs    map[string]bool
+	failedURLs    map[string]int // URL -> HTTP StatusCode
 	mdParser      goldmark.Markdown
 
-	// Shared HTTP clients for Keep-Alive
+	// Shared HTTP clients
 	httpClient       *http.Client
 	noRedirectClient *http.Client
 
 	// Budget & Concurrency Management
 	mu         sync.Mutex
-	tokens     float64
-	lastRefill time.Time
-	apiSem     chan struct{}  // Limits concurrent API calls
-	redirectWG sync.WaitGroup // Waits for async redirect resolutions
+	limiter    *rate.Limiter
+	apiSem     chan struct{}
+	httpSem    chan struct{} // Limits concurrent HTTP checks
+	redirectWG sync.WaitGroup
 
 	// Pipelining
 	queueChan     chan string
@@ -157,6 +157,7 @@ type MirrorApp struct {
 	// Progress Tracking
 	scannedRawCount int32
 	discoveredCount int32
+	finishedCount   int32
 	syncedCount     int32
 	skippedCount    int32
 	failedCount     int32
@@ -164,19 +165,17 @@ type MirrorApp struct {
 	sitemapTotal    int32
 	sitemapDone     int32
 	
-	// API/HTTP Metrics
 	apiReqCount     int32
 	httpReqCount    int32
 	inflightCount   int32
 	activeDiscovery int32
-	isWaitingQuota  int32 // atomic boolean
+	isWaitingQuota  int32
 	
-	// Windowed QPM tracking
 	apiWindow  [60]int32
 	httpWindow [60]int32
 	lastWindowUpdate int64
 
-	lastActivity    int64 // UnixNano
+	lastActivity    int64
 	startTime       time.Time
 	isCI            bool
 }
@@ -196,15 +195,12 @@ type APIError struct {
 
 func main() {
 	cfg := DefaultConfig()
-
-	// 1. First pass to find -config flag
 	tempFS := flag.NewFlagSet("temp", flag.ContinueOnError)
 	tempFS.Usage = func() {}
 	tempFS.SetOutput(io.Discard)
 	configPath := tempFS.String("config", "", "")
 	_ = tempFS.Parse(os.Args[1:])
 
-	// 2. Load TOML if provided (overwrites defaults)
 	if *configPath != "" {
 		if _, err := toml.DecodeFile(*configPath, cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Error decoding config: %v\n", err)
@@ -212,7 +208,6 @@ func main() {
 		}
 	}
 
-	// 3. Define real flags with current cfg as defaults
 	var prefixes, sitemaps stringSlice
 	var sitemapFlagProvided bool
 	flag.StringVar(&cfg.DocsDir, "docs", cfg.DocsDir, "Output directory for documents")
@@ -226,28 +221,21 @@ func main() {
 	flag.Float64Var(&cfg.QuotaPerMinute, "qpm", cfg.QuotaPerMinute, "Quota per minute")
 	flag.DurationVar(&cfg.QuotaWait, "qw", cfg.QuotaWait, "Wait duration when quota is exceeded")
 	flag.DurationVar(&cfg.StallTimeout, "stall-timeout", cfg.StallTimeout, "Max duration without activity before aborting")
-	flag.StringVar(&cfg.SpannerDB, "spanner-db", cfg.SpannerDB, "Spanner database for storage (e.g. projects/P/instances/I/databases/D)")
+	flag.StringVar(&cfg.SpannerDB, "spanner-db", cfg.SpannerDB, "Spanner database for storage")
 	flag.Var(&prefixes, "prefix", "Path prefix(es) to mirror")
 	flag.Func("sitemap", "Sitemap URL(s) to discover links", func(s string) error {
 		sitemapFlagProvided = true
 		return sitemaps.Set(s)
 	})
-	
 	_ = flag.String("config", *configPath, "Path to TOML configuration file")
-
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] [<seed_url> ...]\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 
-	if len(prefixes) > 0 {
-		cfg.Prefixes = prefixes
-	}
-	if sitemapFlagProvided {
-		cfg.Sitemaps = sitemaps
-	}
-	
+	if len(prefixes) > 0 { cfg.Prefixes = prefixes }
+	if sitemapFlagProvided { cfg.Sitemaps = sitemaps }
 	seeds := append(cfg.Seeds, flag.Args()...)
 	if len(seeds) == 0 && !cfg.Refresh && len(cfg.Sitemaps) == 0 {
 		flag.Usage()
@@ -278,18 +266,18 @@ func main() {
 		storage:       storage,
 		processedURLs: make(map[string]bool),
 		redirects:     make(map[string]string),
-		failedURLs:    make(map[string]bool),
+		failedURLs:    make(map[string]int),
 		mdParser:      goldmark.New(),
 		httpClient:    &http.Client{Timeout: 30 * time.Second},
 		noRedirectClient: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: 30 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		},
-		tokens:        cfg.QuotaPerMinute,
-		lastRefill:    time.Now(),
-		apiSem:        make(chan struct{}, 2), // Critical point: max 2 parallel API calls
+		limiter:       rate.NewLimiter(rate.Limit(cfg.QuotaPerMinute/60.0), int(cfg.QuotaPerMinute)),
+		apiSem:        make(chan struct{}, 8), // Increased concurrency
+		httpSem:       make(chan struct{}, 20), // Limit concurrent HTTP checks
 		queueChan:     make(chan string, 10000),
 		sessionQueued: make(map[string]bool),
 		startTime:     time.Now(),
@@ -298,7 +286,6 @@ func main() {
 		isCI:          os.Getenv("CI") == "true",
 	}
 
-	// Start Central Progress Reporter
 	stopProgress := make(chan struct{})
 	progressDone := make(chan struct{})
 	go app.reportProgress(stopProgress, progressDone)
@@ -308,33 +295,45 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Wait for any pending async operations (like redirect resolution)
 	app.redirectWG.Wait()
 	close(stopProgress)
-	<-progressDone // Ensure final draw is finished
-	
-	// Final newline after progress line
+	<-progressDone
 	fmt.Println()
 }
 
-// markActivity updates the last activity timestamp
 func (a *MirrorApp) markActivity() {
 	atomic.StoreInt64(&a.lastActivity, time.Now().UnixNano())
 }
 
-// recordAPIRequest increments API counter and current window
 func (a *MirrorApp) recordAPIRequest() {
 	atomic.AddInt32(&a.apiReqCount, 1)
 	now := time.Now().Unix()
 	idx := now % 60
+	for {
+		last := atomic.LoadInt64(&a.lastWindowUpdate)
+		if last == now { break }
+		if atomic.CompareAndSwapInt64(&a.lastWindowUpdate, last, now) {
+			atomic.StoreInt32(&a.apiWindow[idx], 0)
+			atomic.StoreInt32(&a.httpWindow[idx], 0)
+			break
+		}
+	}
 	atomic.AddInt32(&a.apiWindow[idx], 1)
 }
 
-// recordHTTPRequest increments HTTP counter and current window
 func (a *MirrorApp) recordHTTPRequest() {
 	atomic.AddInt32(&a.httpReqCount, 1)
 	now := time.Now().Unix()
 	idx := now % 60
+	for {
+		last := atomic.LoadInt64(&a.lastWindowUpdate)
+		if last == now { break }
+		if atomic.CompareAndSwapInt64(&a.lastWindowUpdate, last, now) {
+			atomic.StoreInt32(&a.apiWindow[idx], 0)
+			atomic.StoreInt32(&a.httpWindow[idx], 0)
+			break
+		}
+	}
 	atomic.AddInt32(&a.httpWindow[idx], 1)
 }
 
@@ -347,30 +346,14 @@ func (a *MirrorApp) getWindowedQPM() (float64, float64) {
 	return float64(api), float64(http)
 }
 
-func (a *MirrorApp) clearOldWindowBuckets() {
-	now := time.Now().Unix()
-	last := atomic.SwapInt64(&a.lastWindowUpdate, now)
-	for t := last + 1; t <= now; t++ {
-		idx := t % 60
-		atomic.StoreInt32(&a.apiWindow[idx], 0)
-		atomic.StoreInt32(&a.httpWindow[idx], 0)
-	}
-}
-
-// log prints a message while handling the progress line correctly
 func (a *MirrorApp) log(format string, args ...any) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if !a.isCI {
-		fmt.Print("\r\033[K") // Clear current line
-	}
+	if !a.isCI { fmt.Print("\r\033[K") }
 	fmt.Printf(format+"\n", args...)
-	if !a.isCI {
-		a.drawProgressLocked()
-	}
+	if !a.isCI { a.drawProgressLocked() }
 }
 
-// drawProgressLocked draws the progress line. Caller MUST hold a.mu.
 func (a *MirrorApp) drawProgressLocked() {
 	sDone := atomic.LoadInt32(&a.sitemapDone)
 	sTotal := atomic.LoadInt32(&a.sitemapTotal)
@@ -380,23 +363,18 @@ func (a *MirrorApp) drawProgressLocked() {
 	fail := atomic.LoadInt32(&a.failedCount)
 	redir := atomic.LoadInt32(&a.redirectCount)
 	skip := atomic.LoadInt32(&a.skippedCount)
+	done := atomic.LoadInt32(&a.finishedCount)
+	inflight := atomic.LoadInt32(&a.inflightCount)
 	waiting := atomic.LoadInt32(&a.isWaitingQuota) != 0
-
 	apiQPM, httpQPM := a.getWindowedQPM()
 
-	done := synced + fail + redir + skip
 	percent := 0.0
-	if disc > 0 {
-		percent = float64(done) / float64(disc) * 100
-	}
+	if disc > 0 { percent = float64(done) / float64(disc) * 100 }
 
 	elapsedSecs := time.Since(a.startTime).Seconds()
 	overallRate := 0.0
-	if elapsedSecs > 0 {
-		overallRate = float64(done) / elapsedSecs
-	}
+	if elapsedSecs > 0 { overallRate = float64(done) / elapsedSecs }
 
-	// Calculate ETA
 	eta := "??:??"
 	if overallRate > 0 && disc > done {
 		remaining := float64(disc-done) / overallRate
@@ -404,36 +382,21 @@ func (a *MirrorApp) drawProgressLocked() {
 		eta = fmt.Sprintf("%02d:%02d", int(d.Minutes()), int(d.Seconds())%60)
 	}
 
-	// Calculate current tokens (with refill) for display
-	refillRatePerSec := a.cfg.QuotaPerMinute / 60.0
-	now := time.Now()
-	currentTokens := a.tokens + now.Sub(a.lastRefill).Seconds()*refillRatePerSec
-	if currentTokens > a.cfg.QuotaPerMinute {
-		currentTokens = a.cfg.QuotaPerMinute
-	}
-	if currentTokens < 0 {
-		currentTokens = 0
-	}
-
 	status := ""
-	if waiting {
-		status = "[WAITING QUOTA] "
-	}
+	if waiting { status = "[WAITING QUOTA] " }
 
 	if a.isCI {
-		fmt.Printf("[%s] %s[Progress] Sitemaps:%d/%d Scan:%d Total:%d Done:%d (%.1f%%) Synced:%d Skip:%d Redir:%d Fail:%d API_QPM:%.1f HTTP_QPM:%.1f Rate:%.1f/s ETA:%s Quota:%.1f\n",
-			time.Now().Format("15:04:05"), status, sDone, sTotal, raw, disc, done, percent, synced, skip, redir, fail, apiQPM, httpQPM, overallRate, eta, currentTokens)
+		fmt.Printf("[%s] %s[Progress] Sitemaps:%d/%d Scan:%d Total:%d Done:%d (%.1f%%) Inflight:%d Synced:%d Skip:%d Redir:%d Fail:%d API_QPM:%.1f HTTP_QPM:%.1f Rate:%.1f/s ETA:%s\n",
+			time.Now().Format("15:04:05"), status, sDone, sTotal, raw, disc, done, percent, inflight, synced, skip, redir, fail, apiQPM, httpQPM, overallRate, eta)
 	} else {
-		fmt.Printf("\r%s[Sitemaps: %d/%d] [Scan: %d] [Total: %d] [Done: %d (%.1f%%)] [API_QPM: %.1f] [HTTP_QPM: %.1f] [Rate: %.1f/s] [ETA: %s] [Quota: %.1f]   ",
-			status, sDone, sTotal, raw, disc, done, percent, apiQPM, httpQPM, overallRate, eta, currentTokens)
+		fmt.Printf("\r%s[Sitemaps: %d/%d] [Scan: %d] [Total: %d] [Done: %d (%.1f%%)] [Inflight: %d] [API_QPM: %.1f] [HTTP_QPM: %.1f] [Rate: %.1f/s] [ETA: %s]   ",
+			status, sDone, sTotal, raw, disc, done, percent, inflight, apiQPM, httpQPM, overallRate, eta)
 	}
 }
 
 func (a *MirrorApp) reportProgress(stop <-chan struct{}, done chan<- struct{}) {
 	interval := 500 * time.Millisecond
-	if a.isCI {
-		interval = 10 * time.Second
-	}
+	if a.isCI { interval = 10 * time.Second }
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	defer close(done)
@@ -446,25 +409,18 @@ func (a *MirrorApp) reportProgress(stop <-chan struct{}, done chan<- struct{}) {
 			a.mu.Unlock()
 			return
 		case <-ticker.C:
-			a.clearOldWindowBuckets()
 			a.mu.Lock()
 			a.drawProgressLocked()
-			
-			// Stall Detection
 			last := atomic.LoadInt64(&a.lastActivity)
 			idle := time.Since(time.Unix(0, last))
-			
-			// Diagnostics every diagnosticInterval (30s)
 			if idle > diagnosticInterval {
 				inflight := atomic.LoadInt32(&a.inflightCount)
 				discWG := atomic.LoadInt32(&a.activeDiscovery)
 				a.mu.Unlock()
-				a.log("[DIAGNOSTIC] Long idle detected (%v). Inflight: %d, Queue: %d, DiscoveryWG: %d, Tokens: %.2f", 
-					idle.Round(time.Second), inflight, len(a.queueChan), discWG, a.tokens)
+				a.log("[DIAGNOSTIC] Long idle detected (%v). Inflight: %d, Queue: %d, DiscoveryWG: %d", 
+					idle.Round(time.Second), inflight, len(a.queueChan), discWG)
 				a.mu.Lock()
 			}
-
-			// Stall Abort
 			if a.cfg.StallTimeout > 0 && idle > a.cfg.StallTimeout {
 				a.mu.Unlock()
 				fmt.Fprintf(os.Stderr, "\n[FATAL] Activity stall timeout exceeded (%v). Aborting.\n", a.cfg.StallTimeout)
@@ -481,26 +437,13 @@ func (a *MirrorApp) Run(seeds []string) error {
 	a.log("  - Seeds:    %d", len(seeds))
 	a.log("  - Prefixes: %v", a.cfg.Prefixes)
 	a.log("  - Quota:    %.1f QPM", a.cfg.QuotaPerMinute)
-	if a.cfg.SpannerDB != "" {
-		a.log("  - Storage:  Spanner (%s)", a.cfg.SpannerDB)
-	} else {
-		a.log("  - Storage:  Disk (%s)", a.cfg.DocsDir)
-	}
+	if a.cfg.SpannerDB != "" { a.log("  - Storage:  Spanner (%s)", a.cfg.SpannerDB) } else { a.log("  - Storage:  Disk (%s)", a.cfg.DocsDir) }
 
-	if a.cfg.Resume {
-		a.loadMasterListOnly()
-	}
-
-	// shared work counter to track all enqueued tasks including recursive ones
+	if a.cfg.Resume { a.loadMasterListOnly() }
 	var activeWork sync.WaitGroup
-
-	// Start URL Processor (Consumer)
 	processDone := make(chan error, 1)
-	go func() {
-		processDone <- a.processStream(&activeWork)
-	}()
+	go func() { processDone <- a.processStream(&activeWork) }()
 
-	// Discovery 0: Sitemaps
 	if len(a.cfg.Sitemaps) > 0 {
 		atomic.AddInt32(&a.activeDiscovery, 1)
 		a.discoveryWG.Add(1)
@@ -511,12 +454,8 @@ func (a *MirrorApp) Run(seeds []string) error {
 		}()
 	}
 
-	// Discovery 1: Seeds
-	for _, s := range seeds {
-		a.enqueue(s, &activeWork)
-	}
+	a.enqueueBatch(seeds, &activeWork)
 
-	// Discovery 2: HTML Scan (Islands & Nav List)
 	if a.cfg.Discovery {
 		atomic.AddInt32(&a.activeDiscovery, 1)
 		a.discoveryWG.Add(1)
@@ -524,68 +463,51 @@ func (a *MirrorApp) Run(seeds []string) error {
 			defer a.discoveryWG.Done()
 			defer atomic.AddInt32(&a.activeDiscovery, -1)
 			var islands []string
-			for _, s := range seeds {
-				found := a.fetchAndExtractLinks(s, []string{"devsite-tabs-wrapper"})
-				islands = append(islands, found...)
-			}
+			for _, s := range seeds { islands = append(islands, a.fetchAndExtractLinks(s, []string{"devsite-tabs-wrapper"})...) }
 			slices.Sort(islands)
 			islands = slices.Compact(islands)
-			for _, island := range islands {
-				a.enqueue(island, &activeWork)
-			}
-
+			a.enqueueBatch(islands, &activeWork)
+			
 			searchRoots := append(seeds, islands...)
 			slices.Sort(searchRoots)
 			searchRoots = slices.Compact(searchRoots)
 			for _, root := range searchRoots {
-				pages := a.fetchAndExtractLinks(root, []string{"devsite-nav-list"})
-				for _, p := range pages {
-					a.enqueue(p, &activeWork)
-				}
+				found := a.fetchAndExtractLinks(root, []string{"devsite-nav-list"})
+				a.enqueueBatch(found, &activeWork)
 			}
 		}()
 	}
 
-	// Discovery 3: Local Mirror (Recursive)
 	if a.cfg.Recursive {
 		atomic.AddInt32(&a.activeDiscovery, 1)
 		a.discoveryWG.Add(1)
 		go func() {
 			defer a.discoveryWG.Done()
 			defer atomic.AddInt32(&a.activeDiscovery, -1)
-			discoveredFromMD := a.discoverLinksFromMirror()
-			a.enqueueBatch(discoveredFromMD, &activeWork)
+			a.enqueueBatch(a.discoverLinksFromMirror(), &activeWork)
 		}()
 	}
 
-	// Discovery 4: Refresh Mode
 	if a.cfg.Refresh {
-		a.log("Refresh Mode: Reloading existing URLs")
 		a.mu.Lock()
 		existing := make([]string, 0, len(a.processedURLs))
-		for u := range a.processedURLs {
-			existing = append(existing, u)
-		}
+		for u := range a.processedURLs { existing = append(existing, u) }
 		a.mu.Unlock()
 		a.enqueueBatch(existing, &activeWork)
 	}
 
-	// Periodic Metadata Saver
 	stopSaver := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ticker.C:
-				a.saveMetadata()
-			case <-stopSaver:
-				return
+			case <-ticker.C: a.saveMetadata()
+			case <-stopSaver: return
 			}
 		}
 	}()
 
-	// Close channel when all work (initial + recursive/redirects) finish
 	go func() {
 		a.discoveryWG.Wait()
 		activeWork.Wait()
@@ -605,30 +527,19 @@ func (a *MirrorApp) enqueue(u string, wg *sync.WaitGroup) {
 func (a *MirrorApp) enqueueBatch(urls []string, wg *sync.WaitGroup) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	
-	var discovered int32
-	var skipped int32
+	var discovered, skipped int32
 	for _, u := range urls {
-		u = a.normalizeForAPI(u)
-		u = "https://docs.cloud.google.com/" + strings.TrimPrefix(u, "documents/docs.cloud.google.com/")
-
-		if !a.matchesAnyPrefix(u) {
-			continue
-		}
-		
-		if a.sessionQueued[u] {
-			continue
-		}
+		if !a.matchesAnyPrefix(u) { continue }
+		if a.sessionQueued[u] { continue }
 		a.sessionQueued[u] = true
 		discovered++
-
-		if !a.cfg.Refresh && (a.processedURLs[u] || a.failedURLs[u] || a.redirects[u] != "") {
+		if !a.cfg.Refresh && (a.processedURLs[u] || a.failedURLs[u] != 0 || a.redirects[u] != "") {
+			atomic.AddInt32(&a.finishedCount, 1)
 			skipped++
 			continue
 		}
-		
 		atomic.AddInt32(&a.inflightCount, 1)
-		wg.Add(1) // Increment work counter for each URL actually enqueued
+		wg.Add(1)
 		a.queueChan <- u
 		a.markActivity()
 	}
@@ -638,38 +549,30 @@ func (a *MirrorApp) enqueueBatch(urls []string, wg *sync.WaitGroup) {
 
 func (a *MirrorApp) processStream(wg *sync.WaitGroup) error {
 	a.log("Phase 3: Pipelined API Mirroring")
-	
 	type batch []string
 	batches := make(chan batch)
 	var workerWG sync.WaitGroup
 	numWorkers := 30 
-
 	var firstErr error
 	var errMu sync.Mutex
 
-	// Start Workers
 	for w := 0; w < numWorkers; w++ {
 		workerWG.Add(1)
 		go func() {
 			defer workerWG.Done()
 			for b := range batches {
-				err := a.processBatchRecursive(b, wg)
-				if err != nil {
+				if err := a.processBatchRecursive(b, wg); err != nil {
 					errMu.Lock()
-					if firstErr == nil {
-						firstErr = err
-					}
+					if firstErr == nil { firstErr = err }
 					errMu.Unlock()
 				}
 			}
 		}()
 	}
 
-	// Collector: batch items from queueChan with timeout to prevent deadlock
 	var currentBatch []string
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-
 	flush := func() {
 		if len(currentBatch) > 0 {
 			batches <- currentBatch
@@ -687,106 +590,67 @@ func (a *MirrorApp) processStream(wg *sync.WaitGroup) error {
 				return firstErr
 			}
 			currentBatch = append(currentBatch, u)
-			if len(currentBatch) >= batchSize {
-				flush()
-			}
-		case <-ticker.C:
-			flush()
+			if len(currentBatch) >= batchSize { flush() }
+		case <-ticker.C: flush()
 		}
 	}
 }
 
 func (a *MirrorApp) saveMetadata() {
-	if a.cfg.LogDir != "" {
-		os.MkdirAll(a.cfg.LogDir, 0755)
-	}
-
-	saver := func(filename string, data map[string]bool) {
-		if a.cfg.LogDir == "" {
-			return
-		}
-		var l []string
-		for k := range data { l = append(l, k) }
-		sort.Strings(l)
-		os.WriteFile(filepath.Join(a.cfg.LogDir, filename), []byte(strings.Join(l, "\n")+"\n"), 0644)
-	}
+	if a.cfg.LogDir != "" { os.MkdirAll(a.cfg.LogDir, 0755) }
 	
 	a.mu.Lock()
-	saver("urls.txt", a.processedURLs)
-	saver("failed.txt", a.failedURLs)
+	var urls []string
+	for k := range a.processedURLs { urls = append(urls, k) }
+	sort.Strings(urls)
 	
+	var fails []string
+	for k, v := range a.failedURLs { fails = append(fails, fmt.Sprintf("%d %s", v, k)) }
+	sort.Strings(fails)
+
 	var rs []string
 	for k, v := range a.redirects { rs = append(rs, k+" "+v) }
 	sort.Strings(rs)
 	a.mu.Unlock()
 
 	if a.cfg.LogDir != "" {
+		os.WriteFile(filepath.Join(a.cfg.LogDir, "urls.txt"), []byte(strings.Join(urls, "\n")+"\n"), 0644)
+		os.WriteFile(filepath.Join(a.cfg.LogDir, "failed.txt"), []byte(strings.Join(fails, "\n")+"\n"), 0644)
 		os.WriteFile(filepath.Join(a.cfg.LogDir, "redirects.txt"), []byte(strings.Join(rs, "\n")+"\n"), 0644)
 	}
 
 	fileCount := 0
 	filepath.Walk(a.cfg.DocsDir, func(_ string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() && filepath.Ext(info.Name()) == ".md" {
-			fileCount++
-		}
+		if err == nil && !info.IsDir() && filepath.Ext(info.Name()) == ".md" { fileCount++ }
 		return nil
 	})
-
-	metadata := fmt.Sprintf("file_count: %d\nlast_sync: %s\n", 
-		fileCount, time.Now().UTC().Format(time.RFC3339))
+	metadata := fmt.Sprintf("file_count: %d\nlast_sync: %s\n", fileCount, time.Now().UTC().Format(time.RFC3339))
 	os.WriteFile(a.cfg.MetadataFile, []byte(metadata), 0644)
 }
 
 func (a *MirrorApp) isProcessedSession(u string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.processedURLs[u] || a.failedURLs[u] || a.redirects[u] != ""
+	return a.processedURLs[u] || a.failedURLs[u] != 0 || a.redirects[u] != ""
 }
 
-func (a *MirrorApp) takeToken() {
-	for {
-		a.mu.Lock()
-		refillRatePerSec := a.cfg.QuotaPerMinute / 60.0
-		now := time.Now()
-		elapsed := now.Sub(a.lastRefill).Seconds()
-		a.tokens += elapsed * refillRatePerSec
-		if a.tokens > a.cfg.QuotaPerMinute {
-			a.tokens = a.cfg.QuotaPerMinute
-		}
-		a.lastRefill = now
-
-		if a.tokens >= 1.0 {
-			a.tokens -= 1.0
-			a.mu.Unlock()
-			return
-		}
-
-		waitTime := time.Duration((1.0 - a.tokens) / refillRatePerSec * float64(time.Second))
-		a.mu.Unlock()
-		atomic.StoreInt32(&a.isWaitingQuota, 1)
-		a.markActivity() // Signal that we are waiting for quota, not dead
-		time.Sleep(waitTime)
-		atomic.StoreInt32(&a.isWaitingQuota, 0)
-	}
+func (a *MirrorApp) takeTokens(n int) {
+	atomic.StoreInt32(&a.isWaitingQuota, 1)
+	a.markActivity()
+	_ = a.limiter.WaitN(context.Background(), n)
+	atomic.StoreInt32(&a.isWaitingQuota, 0)
 }
 
 func (a *MirrorApp) fetchAndExtractLinks(u string, targetClasses []string) []string {
 	a.recordHTTPRequest()
 	resp, err := a.httpClient.Get(u)
-	if err != nil {
-		return nil
-	}
+	if err != nil { return nil }
 	defer resp.Body.Close()
-
-	// Use the final URL after redirects for base path resolution
 	actualURL := resp.Request.URL.String()
 	basePath := a.toRootRelative(actualURL)
-	links := a.extractLinksWithClassFilter(resp.Body, targetClasses)
-	
 	var results []string
-	for _, l := range links {
-		normalized := a.resolveAndNormalize(l, basePath)
-		if normalized != "" && a.matchesAnyPrefix(normalized) {
+	for _, l := range a.extractLinksWithClassFilter(resp.Body, targetClasses) {
+		if normalized := a.resolveAndNormalize(l, basePath); normalized != "" && a.matchesAnyPrefix(normalized) {
 			results = append(results, normalized)
 		}
 	}
@@ -797,26 +661,20 @@ func (a *MirrorApp) fetchAndExtractLinks(u string, targetClasses []string) []str
 func (a *MirrorApp) extractLinksWithClassFilter(r io.Reader, targetClasses []string) []string {
 	var links []string
 	z := html.NewTokenizer(r)
-	depth := 0
-	inTargetDepth := 0
+	depth, inTargetDepth := 0, 0
 	for {
 		tt := z.Next()
 		switch tt {
-		case html.ErrorToken:
-			return links
+		case html.ErrorToken: return links
 		case html.StartTagToken:
 			depth++
 			t := z.Token()
 			if inTargetDepth == 0 {
 				for _, attr := range t.Attr {
 					if attr.Key == "class" {
-						classes := strings.Fields(attr.Val)
-						for _, c := range classes {
+						for _, c := range strings.Fields(attr.Val) {
 							for _, target := range targetClasses {
-								if c == target {
-									inTargetDepth = depth
-									break
-								}
+								if c == target { inTargetDepth = depth; break }
 							}
 						}
 					}
@@ -824,15 +682,11 @@ func (a *MirrorApp) extractLinksWithClassFilter(r io.Reader, targetClasses []str
 			}
 			if inTargetDepth > 0 && t.Data == "a" {
 				for _, attr := range t.Attr {
-					if attr.Key == "href" {
-						links = append(links, attr.Val)
-					}
+					if attr.Key == "href" { links = append(links, attr.Val) }
 				}
 			}
 		case html.EndTagToken:
-			if inTargetDepth == depth {
-				inTargetDepth = 0
-			}
+			if inTargetDepth == depth { inTargetDepth = 0 }
 			depth--
 		}
 	}
@@ -841,17 +695,13 @@ func (a *MirrorApp) extractLinksWithClassFilter(r io.Reader, targetClasses []str
 func (a *MirrorApp) discoverLinksFromMirror() []string {
 	var allDiscovered []string
 	filepath.Walk(a.cfg.DocsDir, func(fpath string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || filepath.Ext(fpath) != ".md" {
-			return nil
-		}
+		if err != nil || info.IsDir() || filepath.Ext(fpath) != ".md" { return nil }
 		relToDocs, _ := filepath.Rel(a.cfg.DocsDir, fpath)
 		relToDocs = strings.TrimSuffix(relToDocs, ".md")
 		basePath := "/" + strings.TrimPrefix(relToDocs, "docs.cloud.google.com/")
 		content, _ := os.ReadFile(fpath)
-		links := a.extractLinksFromMarkdown(content)
-		for _, l := range links {
-			normalized := a.resolveAndNormalize(l, basePath)
-			if normalized != "" && !a.isProcessedSession(normalized) && a.matchesAnyPrefix(normalized) {
+		for _, l := range a.extractLinksFromMarkdown(content) {
+			if normalized := a.resolveAndNormalize(l, basePath); normalized != "" && !a.isProcessedSession(normalized) && a.matchesAnyPrefix(normalized) {
 				allDiscovered = append(allDiscovered, normalized)
 			}
 		}
@@ -861,24 +711,12 @@ func (a *MirrorApp) discoverLinksFromMirror() []string {
 }
 
 func (a *MirrorApp) resolveAndNormalize(link, basePath string) string {
-	if strings.Contains(link, "://") && !strings.Contains(link, "cloud.google.com") {
-		return ""
-	}
-	
-	// Handle fragments
+	if strings.Contains(link, "://") && !strings.Contains(link, "cloud.google.com") { return "" }
 	link = strings.Split(link, "#")[0]
-	if link == "" {
-		return "https://docs.cloud.google.com" + a.toRootRelative(basePath)
-	}
-
+	if link == "" { return "https://docs.cloud.google.com" + a.toRootRelative(basePath) }
 	rel := link
-	if strings.Contains(rel, "://") {
-		rel = a.toRootRelative(rel)
-	}
-	
-	if !strings.HasPrefix(rel, "/") {
-		rel = path.Join(basePath, rel)
-	}
+	if strings.Contains(rel, "://") { rel = a.toRootRelative(rel) }
+	if !strings.HasPrefix(rel, "/") { rel = path.Join(basePath, rel) }
 	return "https://docs.cloud.google.com" + a.toRootRelative(rel)
 }
 
@@ -886,9 +724,7 @@ func (a *MirrorApp) matchesAnyPrefix(u string) bool {
 	link := a.toRootRelative(u)
 	for _, p := range a.cfg.Prefixes {
 		cleanP := strings.TrimSuffix(p, "/")
-		if link == cleanP || strings.HasPrefix(link, cleanP+"/") {
-			return true
-		}
+		if link == cleanP || strings.HasPrefix(link, cleanP+"/") { return true }
 	}
 	return false
 }
@@ -901,12 +737,8 @@ func (a *MirrorApp) toRootRelative(u string) string {
 	u = strings.Split(u, "#")[0]
 	u = strings.Split(u, "?")[0]
 	u = strings.TrimSuffix(u, ".md")
-	// Use lowercase for path part only to ensure consistent normalization
-	u = strings.ToLower(u)
 	u = path.Clean("/" + u)
-	if u == "." {
-		u = "/"
-	}
+	if u == "." { u = "/" }
 	return u
 }
 
@@ -918,14 +750,10 @@ func (a *MirrorApp) extractLinksFromMarkdown(source []byte) []string {
 		if entering {
 			var dest string
 			switch node := n.(type) {
-			case *ast.Link:
-				dest = string(node.Destination)
-			case *ast.AutoLink:
-				dest = string(node.URL(source))
+			case *ast.Link: dest = string(node.Destination)
+			case *ast.AutoLink: dest = string(node.URL(source))
 			}
-			if dest != "" {
-				links = append(links, dest)
-			}
+			if dest != "" { links = append(links, dest) }
 		}
 		return ast.WalkContinue, nil
 	})
@@ -933,16 +761,10 @@ func (a *MirrorApp) extractLinksFromMarkdown(source []byte) []string {
 }
 
 func (a *MirrorApp) processBatchRecursive(urls []string, wg *sync.WaitGroup) error {
-	if len(urls) == 0 {
-		return nil
-	}
+	if len(urls) == 0 { return nil }
 	docs, apiErr := a.fetchDocsWithRetry(urls)
 	if apiErr == nil {
-		// Sync save to storage
-		if err := a.storage.Save(docs...); err != nil {
-			a.log("Storage error: %v", err)
-		}
-		
+		if err := a.storage.Save(docs...); err != nil { a.log("Storage error: %v", err) }
 		a.mu.Lock()
 		processedMap := make(map[string]bool)
 		for _, doc := range docs {
@@ -953,23 +775,25 @@ func (a *MirrorApp) processBatchRecursive(urls []string, wg *sync.WaitGroup) err
 		}
 		atomic.AddInt32(&a.syncedCount, int32(len(docs)))
 		
-		// Handle potential silent failures (docs requested but not returned)
 		for _, u := range urls {
 			if !processedMap[u] {
-				// Treat missing docs as failures to keep progress accurate
-				a.failedURLs[u] = true
-				atomic.AddInt32(&a.failedCount, 1)
+				// Re-check silent API failures via HTTP for redirects
+				a.redirectWG.Add(1)
+				go func(url string) {
+					defer a.redirectWG.Done()
+					a.handleLeafFailure(url, wg)
+				}(u)
+				continue
 			}
 			atomic.AddInt32(&a.inflightCount, -1)
-			wg.Done() // URL processing finished (synced or missing)
+			atomic.AddInt32(&a.finishedCount, 1)
+			wg.Done()
 		}
 		a.markActivity()
 		a.mu.Unlock()
 		return nil
 	}
-	
 	if len(urls) == 1 {
-		// Offload redirect resolution to separate goroutine to not block API pipeline
 		a.redirectWG.Add(1)
 		go func(u string) {
 			defer a.redirectWG.Done()
@@ -978,27 +802,21 @@ func (a *MirrorApp) processBatchRecursive(urls []string, wg *sync.WaitGroup) err
 		return nil
 	}
 	mid := len(urls) / 2
-	a.processBatchRecursive(urls[:mid], wg)
-	return a.processBatchRecursive(urls[mid:], wg)
+	go a.processBatchRecursive(urls[:mid], wg)
+	go a.processBatchRecursive(urls[mid:], wg)
+	return nil
 }
 
 func (a *MirrorApp) fetchDocsWithRetry(urls []string) ([]Document, *APIError) {
 	for i := 0; i < 5; i++ {
 		docs, apiErr := a.fetchDocs(urls)
-		if apiErr == nil {
-			return docs, nil
-		}
+		if apiErr == nil { return docs, nil }
 		if apiErr.Error.Code == 429 || apiErr.Error.Status == "RESOURCE_EXHAUSTED" {
 			a.log("Quota exceeded (429). Waiting %v for window reset (attempt %d/5)...", a.cfg.QuotaWait, i+1)
 			atomic.StoreInt32(&a.isWaitingQuota, 1)
 			a.markActivity()
 			time.Sleep(a.cfg.QuotaWait)
 			atomic.StoreInt32(&a.isWaitingQuota, 0)
-			
-			a.mu.Lock()
-			a.tokens = a.cfg.QuotaPerMinute
-			a.lastRefill = time.Now()
-			a.mu.Unlock()
 			continue
 		}
 		return nil, apiErr
@@ -1007,34 +825,23 @@ func (a *MirrorApp) fetchDocsWithRetry(urls []string) ([]Document, *APIError) {
 }
 
 func (a *MirrorApp) fetchDocs(urls []string) ([]Document, *APIError) {
-	// Limit concurrent API calls to avoid overwhelming the strict quota
 	a.apiSem <- struct{}{}
 	defer func() { <-a.apiSem }()
-
 	a.recordAPIRequest()
-	a.takeToken()
+	a.takeTokens(1)
 	v := url.Values{}
-	for _, u := range urls {
-		v.Add("names", a.normalizeForAPI(u))
-	}
+	for _, u := range urls { v.Add("names", a.normalizeForAPI(u)) }
 	reqURL := "https://developerknowledge.googleapis.com/v1alpha/documents:batchGet?" + v.Encode()
 	req, _ := http.NewRequest("GET", reqURL, nil)
 	req.Header.Set("X-Goog-Api-Key", a.cfg.APIKey)
-
 	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		return nil, makeSimpleError(err.Error())
-	}
+	if err != nil { return nil, makeSimpleError(err.Error()) }
 	defer resp.Body.Close()
-
 	if resp.StatusCode == 429 {
 		apiErr := &APIError{}
-		apiErr.Error.Code = 429
-		apiErr.Error.Message = "Quota exceeded"
-		apiErr.Error.Status = "RESOURCE_EXHAUSTED"
+		apiErr.Error.Code, apiErr.Error.Message, apiErr.Error.Status = 429, "Quota exceeded", "RESOURCE_EXHAUSTED"
 		return nil, apiErr
 	}
-
 	var res struct {
 		Documents []Document `json:"documents"`
 		Error     *struct {
@@ -1043,51 +850,43 @@ func (a *MirrorApp) fetchDocs(urls []string) ([]Document, *APIError) {
 			Status  string `json:"status"`
 		} `json:"error"`
 	}
-	
 	body, _ := io.ReadAll(resp.Body)
-	if err := json.Unmarshal(body, &res); err != nil {
-		return nil, makeSimpleError(fmt.Sprintf("JSON parse error: %v (Status: %d)", err, resp.StatusCode))
-	}
-
+	if err := json.Unmarshal(body, &res); err != nil { return nil, makeSimpleError(fmt.Sprintf("JSON parse error: %v (Status: %d)", err, resp.StatusCode)) }
 	if res.Error != nil {
 		apiErr := &APIError{}
-		apiErr.Error.Code = res.Error.Code
-		apiErr.Error.Message = res.Error.Message
-		apiErr.Error.Status = res.Error.Status
+		apiErr.Error.Code, apiErr.Error.Message, apiErr.Error.Status = res.Error.Code, res.Error.Message, res.Error.Status
 		return nil, apiErr
 	}
-	
-	if resp.StatusCode != 200 {
-		return nil, makeSimpleError(fmt.Sprintf("HTTP Error %d", resp.StatusCode))
-	}
-
+	if resp.StatusCode != 200 { return nil, makeSimpleError(fmt.Sprintf("HTTP Error %d", resp.StatusCode)) }
 	return res.Documents, nil
 }
 
 func (a *MirrorApp) normalizeForAPI(u string) string {
 	name := strings.TrimPrefix(u, "https://")
 	name = strings.TrimPrefix(name, "http://")
-	if strings.HasPrefix(name, "cloud.google.com/") {
-		name = "docs.cloud.google.com/" + strings.TrimPrefix(name, "cloud.google.com/")
-	}
+	if strings.HasPrefix(name, "cloud.google.com/") { name = "docs.cloud.google.com/" + strings.TrimPrefix(name, "cloud.google.com/") }
 	return "documents/" + name
 }
 
 func (a *MirrorApp) handleLeafFailure(u string, wg *sync.WaitGroup) error {
+	a.httpSem <- struct{}{}
+	defer func() { <-a.httpSem }()
+
 	curr := u
+	lastStatus := 0
 	for i := 0; i < 10; i++ {
 		a.recordHTTPRequest()
 		resp, err := a.noRedirectClient.Get(curr)
-		if err != nil || (resp.StatusCode/100 != 3) {
+		if err != nil { break }
+		lastStatus = resp.StatusCode
+		if resp.StatusCode/100 != 3 {
+			resp.Body.Close()
 			break
 		}
 		loc := resp.Header.Get("Location")
-		if loc == "" {
-			break
-		}
-		if strings.HasPrefix(loc, "/") {
-			loc = "https://docs.cloud.google.com" + loc
-		}
+		resp.Body.Close()
+		if loc == "" { break }
+		if strings.HasPrefix(loc, "/") { loc = "https://docs.cloud.google.com" + loc }
 		curr = loc
 	}
 	if curr != u {
@@ -1098,24 +897,23 @@ func (a *MirrorApp) handleLeafFailure(u string, wg *sync.WaitGroup) error {
 		a.enqueue(curr, wg)
 	} else {
 		a.mu.Lock()
-		a.failedURLs[u] = true
+		a.failedURLs[u] = lastStatus
 		atomic.AddInt32(&a.failedCount, 1)
 		a.mu.Unlock()
 		lpath := filepath.Join(a.cfg.DocsDir, strings.TrimPrefix(a.normalizeForAPI(u), "documents/") + ".md")
 		os.Remove(lpath)
 	}
 	atomic.AddInt32(&a.inflightCount, -1)
+	atomic.AddInt32(&a.finishedCount, 1)
 	a.markActivity()
-	wg.Done() // Original URL processing (which failed/redirected) is finished
+	wg.Done()
 	return nil
 }
 
 func (a *MirrorApp) loadMasterListOnly() {
 	processed, _ := a.storage.LoadProcessedURLs()
 	a.mu.Lock()
-	for k, v := range processed {
-		a.processedURLs[k] = v
-	}
+	for k, v := range processed { a.processedURLs[k] = v }
 	a.mu.Unlock()
 }
 

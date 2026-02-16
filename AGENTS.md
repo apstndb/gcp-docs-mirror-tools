@@ -57,3 +57,4 @@ Always use `toRootRelative` and `resolveAndNormalize` for consistent URL handlin
 
 ### API Key
 Requires `DEVELOPERKNOWLEDGE_API_KEY` environment variable.
+- All content within the repository, including code comments and documentation, MUST be in English.
