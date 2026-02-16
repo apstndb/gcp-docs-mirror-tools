@@ -25,6 +25,7 @@ func (a *MirrorApp) DiscoverFromSitemaps(sitemapURLs []string, activeWork *sync.
 		sem <- struct{}{}
 		defer func() { <-sem }()
 
+		a.recordHTTPRequest()
 		resp, err := a.httpClient.Get(u)
 		if err != nil {
 			a.log("    Warning: failed to fetch %s: %v", u, err)
@@ -51,7 +52,8 @@ func (a *MirrorApp) DiscoverFromSitemaps(sitemapURLs []string, activeWork *sync.
 					var entry locEntry
 					if err := decoder.DecodeElement(&entry, &se); err == nil {
 						atomic.AddInt32(&a.sitemapTotal, 1)
-						sitemapWG.Go(func() { crawl(entry.Loc) })
+						sitemapWG.Add(1)
+						go func() { crawl(entry.Loc) }()
 					}
 				} else if se.Name.Local == "url" {
 					var entry locEntry
@@ -78,6 +80,7 @@ func (a *MirrorApp) DiscoverFromSitemaps(sitemapURLs []string, activeWork *sync.
 		}
 		
 		atomic.AddInt32(&a.sitemapDone, 1)
+		a.markActivity()
 		if a.cfg.Verbose {
 			a.log("  Finished Sitemap: %s (%d URLs)", u, count)
 		}
@@ -85,7 +88,8 @@ func (a *MirrorApp) DiscoverFromSitemaps(sitemapURLs []string, activeWork *sync.
 
 	for _, u := range sitemapURLs {
 		atomic.AddInt32(&a.sitemapTotal, 1)
-		sitemapWG.Go(func() { crawl(u) })
+		sitemapWG.Add(1)
+		go func() { crawl(u) }()
 	}
 
 	sitemapWG.Wait()
