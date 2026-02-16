@@ -9,7 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  build-release:
+  build:
+    name: Build Binary
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -38,8 +39,34 @@ jobs:
           go build -ldflags "-X main.Version=${{ github.ref_name }} -X main.Commit=${{ github.sha }} -X main.BuildTime=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" -o dist/${BINARY_NAME} .
           cd dist && tar czf ../gcp-docs-mirror-tools-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz ${BINARY_NAME}
 
-      - name: Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: "*.tar.gz"
-          generate_release_notes: true
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: "*.tar.gz"
+
+  publish:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+
+      - name: Generate Checksums
+        run: sha256sum *.tar.gz > SHA256SUMS.txt
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --title "Release ${{ github.ref_name }}" \
+            --generate-notes \
+            *.tar.gz SHA256SUMS.txt
