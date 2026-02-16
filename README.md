@@ -30,13 +30,16 @@ gcp-docs-mirror -r -qpm 50 -prefix "/spanner/,/sdk/gcloud/" https://cloud.google
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-config` | Path to TOML configuration file | `""` |
+| `-prefix` | Comma-separated path prefixes to mirror | `/spanner/docs/` |
+| `-sitemap`| Sitemap URL(s) to discover links | `nil` |
+| `-spanner-db`| Spanner database (projects/P/instances/I/databases/D) | `""` |
+| `-qpm` | Quota per minute (requests per minute) | `50.0` |
+| `-v` | Enable verbose logging | `false` |
 | `-r` | Enable recursive discovery from Markdown content | `false` |
 | `-f` | Refresh existing documents | `false` |
-| `-prefix` | Comma-separated path prefixes to mirror | `/spanner/docs/` |
-| `-qpm` | Quota per minute (requests per minute) | `100.0` |
-| `-qw` | Wait duration when quota is exceeded | `1m5s` |
+| `-qw` | Wait duration when quota is exceeded | `1m10s` |
 | `-docs` | Output directory for documents | `docs` |
-| `-logs` | Directory for log files (`urls.txt`, `redirects.txt`, `failed.txt`) | `logs` |
+| `-logs` | Directory for log files | `logs` |
 | `-metadata` | Path to metadata summary file | `metadata.yaml` |
 
 ### Configuration File (`settings.toml`)

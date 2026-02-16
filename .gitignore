@@ -1,7 +1,9 @@
 gcp-docs-mirror
 tmp/
 docs/
-urls.txt
-redirect_cache.txt
-failed_urls.txt
+/logs/
+.idea/
 .DS_Store
+metadata.yaml
+test_logs/
+test_docs/
