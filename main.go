@@ -56,6 +56,7 @@ type Config struct {
 	MetadataFile   string        `toml:"metadata_file"`
 	Recursive      bool          `toml:"recursive"`
 	Refresh        bool          `toml:"refresh"`
+	Resume         bool          `toml:"resume"`
 	Discovery      bool          `toml:"discovery"`
 	Verbose        bool          `toml:"verbose"`
 	Prefixes       []string      `toml:"prefixes"`
@@ -200,6 +201,7 @@ func main() {
 	flag.StringVar(&cfg.MetadataFile, "metadata", cfg.MetadataFile, "Path to metadata summary file")
 	flag.BoolVar(&cfg.Recursive, "r", cfg.Recursive, "Recursive discovery from Markdown content")
 	flag.BoolVar(&cfg.Refresh, "f", cfg.Refresh, "Refresh existing documents")
+	flag.BoolVar(&cfg.Resume, "resume", cfg.Resume, "Resume from existing progress in logs")
 	flag.BoolVar(&cfg.Discovery, "discovery", cfg.Discovery, "Discover more links from HTML navigation")
 	flag.BoolVar(&cfg.Verbose, "v", cfg.Verbose, "Enable verbose logging")
 	flag.Float64Var(&cfg.QuotaPerMinute, "qpm", cfg.QuotaPerMinute, "Quota per minute")
@@ -368,7 +370,9 @@ func (a *MirrorApp) reportProgress(stop <-chan struct{}, done chan<- struct{}) {
 }
 
 func (a *MirrorApp) Run(seeds []string) error {
-	a.loadMasterListOnly()
+	if a.cfg.Resume {
+		a.loadMasterListOnly()
+	}
 
 	// Start URL Processor (Consumer)
 	processDone := make(chan error, 1)
