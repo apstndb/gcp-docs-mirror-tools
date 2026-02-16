@@ -2,6 +2,8 @@ module github.com/apstndb/gcp-docs-mirror-tools
 
 go 1.25
 
+retract v0.2.0 // Contains a critical deadlock bug in the pipeline collector.
+
 require (
 	cloud.google.com/go/spanner v1.88.0
 	github.com/BurntSushi/toml v1.6.0
