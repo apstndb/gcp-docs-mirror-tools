@@ -1,6 +1,6 @@
-# GCP Docs Mirror Tools (Go)
+# Firestore Docs Mirror Tools (Go)
 
-A high-performance, robust tool to recursively discover and mirror Google Cloud documentation in Markdown format using the Developer Knowledge API.
+A high-performance, robust tool to recursively discover and mirror [Firestore](https://cloud.google.com/firestore/docs) documentation in Markdown format using the Developer Knowledge API.
 
 ## Features
 - **Intelligent Discovery**: Uses Goldmark (Markdown AST) and HTML parsing to accurately identify links in sidebars and navigation bars.
@@ -19,18 +19,18 @@ go install github.com/apstndb/gcp-docs-mirror-tools@latest
 ```bash
 export DEVELOPERKNOWLEDGE_API_KEY=your_api_key
 
-# Mirror Spanner documentation using a config file
+# Mirror Firestore documentation using a config file
 gcp-docs-mirror -config settings.toml
 
 # Or use command line flags
-gcp-docs-mirror -r -qpm 50 -prefix "/spanner/,/sdk/gcloud/" https://cloud.google.com/spanner/docs
+gcp-docs-mirror -r -qpm 50 -prefix "/firestore/docs/" https://cloud.google.com/firestore/docs
 ```
 
 ### Options
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-config` | Path to TOML configuration file | `""` |
-| `-prefix` | Comma-separated path prefixes to mirror | `/spanner/docs/` |
+| `-prefix` | Comma-separated path prefixes to mirror | `/firestore/docs/` |
 | `-sitemap`| Sitemap URL(s) to discover links | `nil` |
 | `-spanner-db`| Spanner database (projects/P/instances/I/databases/D) | `""` |
 | `-qpm` | Quota per minute (requests per minute) | `50.0` |
@@ -45,10 +45,9 @@ gcp-docs-mirror -r -qpm 50 -prefix "/spanner/,/sdk/gcloud/" https://cloud.google
 ### Configuration File (`settings.toml`)
 ```toml
 seeds = [
-    "https://docs.cloud.google.com/spanner/docs",
-    "https://docs.cloud.google.com/sdk/gcloud/reference/spanner"
+    "https://docs.cloud.google.com/firestore/docs"
 ]
-prefixes = ["/spanner/", "/sdk/gcloud/reference/spanner/"]
+prefixes = ["/firestore/docs/"]
 recursive = true
 qpm = 50.0
 qw = "70s"

@@ -79,7 +79,7 @@ func DefaultConfig() *Config {
 		Recursive:      false,
 		Refresh:        false,
 		Discovery:      true,
-		Prefixes:       []string{"/spanner/docs/"},
+		Prefixes:       []string{"/firestore/docs/"},
 		Sitemaps:       nil,
 		QuotaPerMinute: 50.0,
 		QuotaWait:      70 * time.Second,
