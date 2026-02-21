@@ -1,18 +1,10 @@
+seeds = [
+    "https://docs.cloud.google.com/firestore/docs/samples/firestore-data-set-id-random-collection-async"
+]
 prefixes = [
-    "/spanner/docs/",
-    "/bigquery/docs/",
-    "/bigtable/docs/",
-    "/firestore/docs/",
-    "/storage/docs/",
-    "/compute/docs/",
-    "/kubernetes-engine/docs/",
-    "/run/docs/",
-    "/pubsub/docs/",
-    "/dataflow/docs/",
-    "/resource-manager/docs/"
+    "/firestore/"
 ]
 
-spanner_db = "projects/apstndb-sandbox/instances/apstndb-sandbox/databases/gcp-docs"
 qpm = 90
 discovery = false
 sitemaps = ["https://docs.cloud.google.com/sitemap.xml"]
