@@ -23,14 +23,14 @@ export DEVELOPERKNOWLEDGE_API_KEY=your_api_key
 gcp-docs-mirror -config settings.toml
 
 # Or use command line flags
-gcp-docs-mirror -r -qpm 50 -prefix "/firestore/docs/" https://cloud.google.com/firestore/docs
+gcp-docs-mirror -r -qpm 50 -prefix "/firestore/" https://cloud.google.com/firestore/docs
 ```
 
 ### Options
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-config` | Path to TOML configuration file | `""` |
-| `-prefix` | Comma-separated path prefixes to mirror | `/firestore/docs/` |
+| `-prefix` | Comma-separated path prefixes to mirror | `/firestore/` |
 | `-sitemap`| Sitemap URL(s) to discover links | `nil` |
 | `-spanner-db`| Spanner database (projects/P/instances/I/databases/D) | `""` |
 | `-qpm` | Quota per minute (requests per minute) | `50.0` |
@@ -45,9 +45,10 @@ gcp-docs-mirror -r -qpm 50 -prefix "/firestore/docs/" https://cloud.google.com/f
 ### Configuration File (`settings.toml`)
 ```toml
 seeds = [
-    "https://docs.cloud.google.com/firestore/docs"
+    "https://docs.cloud.google.com/firestore/docs",
+    "https://docs.cloud.google.com/firestore/docs/samples/firestore-data-set-id-random-collection-async"
 ]
-prefixes = ["/firestore/docs/"]
+prefixes = ["/firestore/"]
 recursive = true
 qpm = 50.0
 qw = "70s"

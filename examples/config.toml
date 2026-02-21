@@ -1,5 +1,8 @@
+seeds = [
+    "https://docs.cloud.google.com/firestore/docs/samples/firestore-data-set-id-random-collection-async"
+]
 prefixes = [
-    "/firestore/docs/"
+    "/firestore/"
 ]
 
 qpm = 90
