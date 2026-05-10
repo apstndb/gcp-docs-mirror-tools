@@ -200,7 +200,7 @@ func TestEnqueueBatch(t *testing.T) {
 	}
 
 	// Verify WaitGroup was incremented correctly
-	// We can't directly check the internal counter of WaitGroup, 
+	// We can't directly check the internal counter of WaitGroup,
 	// but we can try to call Done() and see if it's correct.
 	// However, a better way is to see if we can read from the channel and then Wait().
 	u := <-app.queueChan
@@ -220,8 +220,20 @@ func TestDiskStorage_Save(t *testing.T) {
 
 	storage := &DiskStorage{docsDir: tmpDir}
 	docs := []Document{
-		{Name: "documents/docs.cloud.google.com/test/page1", Content: "Content 1"},
-		{Name: "documents/docs.cloud.google.com/test/page2", Content: "Content 2\n"},
+		{
+			Name:       "documents/docs.cloud.google.com/test/page1",
+			URI:        "https://docs.cloud.google.com/test/page1",
+			Title:      "Page 1",
+			UpdateTime: "2026-05-08T21:32:47Z",
+			Content:    "Content 1",
+		},
+		{
+			Name:       "documents/docs.cloud.google.com/test/page2",
+			URI:        "https://docs.cloud.google.com/test/page2",
+			Title:      "Page 2",
+			UpdateTime: "2026-05-08T21:32:47Z",
+			Content:    "Content 2\n",
+		},
 	}
 
 	if err := storage.Save(docs...); err != nil {
@@ -234,8 +246,9 @@ func TestDiskStorage_Save(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(c1) != "Content 1\n" { // Should have added newline
-		t.Errorf("Expected 'Content 1\\n', got %q", string(c1))
+	expected1 := "---\nname: documents/docs.cloud.google.com/test/page1\nuri: https://docs.cloud.google.com/test/page1\ntitle: Page 1\nupdate_time: \"2026-05-08T21:32:47Z\"\n---\n\nContent 1\n"
+	if string(c1) != expected1 {
+		t.Errorf("Expected %q, got %q", expected1, string(c1))
 	}
 
 	// Verify file 2
@@ -244,7 +257,8 @@ func TestDiskStorage_Save(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(c2) != "Content 2\n" { // Should not have doubled newline
-		t.Errorf("Expected 'Content 2\\n', got %q", string(c2))
+	expected2 := "---\nname: documents/docs.cloud.google.com/test/page2\nuri: https://docs.cloud.google.com/test/page2\ntitle: Page 2\nupdate_time: \"2026-05-08T21:32:47Z\"\n---\n\nContent 2\n"
+	if string(c2) != expected2 {
+		t.Errorf("Expected %q, got %q", expected2, string(c2))
 	}
 }

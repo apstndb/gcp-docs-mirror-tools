@@ -55,6 +55,6 @@ When using `BatchWrite`, always ensure the `mutation_groups` indices align perfe
 ### URL Normalization Rules
 Always use `toRootRelative` and `resolveAndNormalize` for consistent URL handling. The API expects `documents/docs.cloud.google.com/PATH`.
 
-### API Key
-Requires `DEVELOPERKNOWLEDGE_API_KEY` environment variable.
+### Authentication
+Prefer `DEVELOPERKNOWLEDGE_API_KEY` or `GOOGLE_API_KEY`. If neither is set, use ADC. Local `authorized_user` ADC requires a quota project via `GOOGLE_CLOUD_QUOTA_PROJECT` or `gcloud auth application-default set-quota-project`.
 - All content within the repository, including code comments and documentation, MUST be in English.

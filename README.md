@@ -8,6 +8,7 @@ A high-performance, robust tool to recursively discover and mirror Google Cloud 
 - **Adaptive Batching**: Uses a recursive binary-search algorithm to isolate missing pages or redirects within atomic batch requests.
 - **Normalization**: Automatically normalizes URLs (strips trailing slashes, fragments, and `.md` extensions) to ensure consistency and prevent redundant downloads.
 - **Rate Limiting**: Implements a token-bucket budget management system with adjustable quota wait times to prevent 429 errors.
+- **YAML Frontmatter**: Prepends document metadata from the Developer Knowledge API to mirrored Markdown files.
 - **TOML Configuration**: Supports external configuration files for easy management of seeds, prefixes, and performance settings.
 
 ## Installation
@@ -15,9 +16,26 @@ A high-performance, robust tool to recursively discover and mirror Google Cloud 
 go install github.com/apstndb/gcp-docs-mirror-tools@latest
 ```
 
+## Authentication
+Use either:
+
+- `DEVELOPERKNOWLEDGE_API_KEY` or `GOOGLE_API_KEY`, or
+- Application Default Credentials via `gcloud auth application-default login`
+
+When using local user ADC, set a quota project as well:
+
+```bash
+gcloud auth application-default set-quota-project <project-id>
+```
+
 ## Usage
 ```bash
+# API key authentication
 export DEVELOPERKNOWLEDGE_API_KEY=your_api_key
+
+# Or use ADC instead
+# gcloud auth application-default login
+# gcloud auth application-default set-quota-project <project-id>
 
 # Mirror Spanner documentation using a config file
 gcp-docs-mirror -config settings.toml
@@ -53,6 +71,16 @@ recursive = true
 qpm = 50.0
 qw = "70s"
 ```
+
+## Output
+File-based mirrors are written as Markdown with YAML frontmatter. The frontmatter currently includes:
+
+- `name`
+- `uri`
+- `title`
+- `description`
+- `data_source`
+- `update_time`
 
 ## License
 MIT
