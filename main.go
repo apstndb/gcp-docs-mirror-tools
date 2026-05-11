@@ -93,6 +93,10 @@ type Storage interface {
 	LoadProcessedURLs() (map[string]bool, error)
 }
 
+type ProcessedURLUpdateTimeLoader interface {
+	LoadProcessedURLUpdateTimes() (map[string]string, error)
+}
+
 type DiskStorage struct {
 	docsDir           string
 	logDir            string
@@ -118,19 +122,31 @@ func (s *DiskStorage) Save(docs ...Document) error {
 }
 
 func (s *DiskStorage) LoadProcessedURLs() (map[string]bool, error) {
+	updateTimes, err := s.LoadProcessedURLUpdateTimes()
+	if err != nil {
+		return nil, err
+	}
+	processed := make(map[string]bool, len(updateTimes))
+	for u := range updateTimes {
+		processed[u] = true
+	}
+	return processed, nil
+}
+
+func (s *DiskStorage) LoadProcessedURLUpdateTimes() (map[string]string, error) {
 	if s.logDir == "" {
-		return make(map[string]bool), nil
+		return make(map[string]string), nil
 	}
 	f, err := os.Open(filepath.Join(s.logDir, "urls.txt"))
 	if err != nil {
-		return make(map[string]bool), nil
+		return make(map[string]string), nil
 	}
 	defer f.Close()
-	processed := make(map[string]bool)
+	processed := make(map[string]string)
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		if t := strings.TrimSpace(scanner.Text()); t != "" {
-			processed[t] = true
+		if url, updateTime := parseProcessedURLLogLine(scanner.Text()); url != "" {
+			processed[url] = updateTime
 		}
 	}
 	return processed, nil
@@ -140,6 +156,7 @@ type MirrorApp struct {
 	cfg           *Config
 	storage       Storage
 	processedURLs map[string]bool
+	updateTimes   map[string]string
 	redirects     map[string]string
 	failedURLs    map[string]int // URL -> HTTP StatusCode
 	mdParser      goldmark.Markdown
@@ -286,6 +303,7 @@ func main() {
 		cfg:           cfg,
 		storage:       storage,
 		processedURLs: make(map[string]bool),
+		updateTimes:   make(map[string]string),
 		redirects:     make(map[string]string),
 		failedURLs:    make(map[string]int),
 		mdParser:      goldmark.New(),
@@ -666,6 +684,10 @@ func (a *MirrorApp) saveMetadata() {
 		urls = append(urls, k)
 	}
 	sort.Strings(urls)
+	urlLines := make([]string, 0, len(urls))
+	for _, u := range urls {
+		urlLines = append(urlLines, formatProcessedURLLogLine(u, a.updateTimes[u]))
+	}
 
 	var fails []string
 	for k, v := range a.failedURLs {
@@ -681,7 +703,7 @@ func (a *MirrorApp) saveMetadata() {
 	a.mu.Unlock()
 
 	if a.cfg.LogDir != "" {
-		os.WriteFile(filepath.Join(a.cfg.LogDir, "urls.txt"), []byte(strings.Join(urls, "\n")+"\n"), 0644)
+		os.WriteFile(filepath.Join(a.cfg.LogDir, "urls.txt"), []byte(strings.Join(urlLines, "\n")+"\n"), 0644)
 		os.WriteFile(filepath.Join(a.cfg.LogDir, "failed.txt"), []byte(strings.Join(fails, "\n")+"\n"), 0644)
 		os.WriteFile(filepath.Join(a.cfg.LogDir, "redirects.txt"), []byte(strings.Join(rs, "\n")+"\n"), 0644)
 	}
@@ -873,6 +895,7 @@ func (a *MirrorApp) processBatchRecursive(urls []string, wg *sync.WaitGroup) err
 			relPath := strings.TrimPrefix(doc.Name, "documents/")
 			u := "https://docs.cloud.google.com/" + strings.TrimPrefix(relPath, "docs.cloud.google.com/")
 			a.processedURLs[u] = true
+			a.updateTimes[u] = doc.UpdateTime
 			processedMap[u] = true
 		}
 		atomic.AddInt32(&a.syncedCount, int32(len(docs)))
@@ -1034,6 +1057,14 @@ func (a *MirrorApp) handleLeafFailure(u string, wg *sync.WaitGroup) error {
 
 func (a *MirrorApp) loadMasterListOnly() {
 	processed, _ := a.storage.LoadProcessedURLs()
+	if loader, ok := a.storage.(ProcessedURLUpdateTimeLoader); ok {
+		updateTimes, _ := loader.LoadProcessedURLUpdateTimes()
+		a.mu.Lock()
+		for k, v := range updateTimes {
+			a.updateTimes[k] = v
+		}
+		a.mu.Unlock()
+	}
 	a.mu.Lock()
 	for k, v := range processed {
 		a.processedURLs[k] = v
@@ -1045,4 +1076,20 @@ func makeSimpleError(msg string) *APIError {
 	e := &APIError{}
 	e.Error.Message = msg
 	return e
+}
+
+func parseProcessedURLLogLine(line string) (string, string) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return "", ""
+	}
+	parts := strings.SplitN(line, "\t", 2)
+	if len(parts) == 1 {
+		return parts[0], ""
+	}
+	return parts[0], strings.TrimSpace(parts[1])
+}
+
+func formatProcessedURLLogLine(url, updateTime string) string {
+	return url + "\t" + updateTime
 }

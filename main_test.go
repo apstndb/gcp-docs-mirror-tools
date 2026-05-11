@@ -262,3 +262,67 @@ func TestDiskStorage_Save(t *testing.T) {
 		t.Errorf("Expected %q, got %q", expected2, string(c2))
 	}
 }
+
+func TestDiskStorageLoadProcessedURLUpdateTimes(t *testing.T) {
+	tmpDir := t.TempDir()
+	logDir := filepath.Join(tmpDir, "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := strings.Join([]string{
+		"https://docs.cloud.google.com/spanner/docs\t2026-05-08T21:32:47Z",
+		"https://docs.cloud.google.com/spanner/docs/backup",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(logDir, "urls.txt"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	storage := &DiskStorage{logDir: logDir}
+	got, err := storage.LoadProcessedURLUpdateTimes()
+	if err != nil {
+		t.Fatalf("LoadProcessedURLUpdateTimes() error = %v", err)
+	}
+	want := map[string]string{
+		"https://docs.cloud.google.com/spanner/docs":        "2026-05-08T21:32:47Z",
+		"https://docs.cloud.google.com/spanner/docs/backup": "",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("LoadProcessedURLUpdateTimes() = %#v, want %#v", got, want)
+	}
+}
+
+func TestSaveMetadataWritesURLLogWithUpdateTime(t *testing.T) {
+	tmpDir := t.TempDir()
+	app := &MirrorApp{
+		cfg: &Config{
+			LogDir:       filepath.Join(tmpDir, "logs"),
+			DocsDir:      filepath.Join(tmpDir, "docs"),
+			MetadataFile: filepath.Join(tmpDir, "metadata.yaml"),
+		},
+		processedURLs: map[string]bool{
+			"https://docs.cloud.google.com/spanner/docs":        true,
+			"https://docs.cloud.google.com/spanner/docs/backup": true,
+		},
+		updateTimes: map[string]string{
+			"https://docs.cloud.google.com/spanner/docs":        "2026-05-08T21:32:47Z",
+			"https://docs.cloud.google.com/spanner/docs/backup": "",
+		},
+		failedURLs: make(map[string]int),
+		redirects:  make(map[string]string),
+	}
+
+	app.saveMetadata()
+
+	data, err := os.ReadFile(filepath.Join(app.cfg.LogDir, "urls.txt"))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	got := string(data)
+	want := "" +
+		"https://docs.cloud.google.com/spanner/docs\t2026-05-08T21:32:47Z\n" +
+		"https://docs.cloud.google.com/spanner/docs/backup\t\n"
+	if got != want {
+		t.Fatalf("urls.txt = %q, want %q", got, want)
+	}
+}
