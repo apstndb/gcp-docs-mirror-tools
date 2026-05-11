@@ -246,7 +246,7 @@ func TestDiskStorage_Save(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected1 := "---\nname: documents/docs.cloud.google.com/test/page1\nuri: https://docs.cloud.google.com/test/page1\ntitle: Page 1\nupdate_time: \"2026-05-08T21:32:47Z\"\n---\n\nContent 1\n"
+	expected1 := "---\nname: documents/docs.cloud.google.com/test/page1\nuri: https://docs.cloud.google.com/test/page1\ntitle: Page 1\n---\n\nContent 1\n"
 	if string(c1) != expected1 {
 		t.Errorf("Expected %q, got %q", expected1, string(c1))
 	}
@@ -257,7 +257,7 @@ func TestDiskStorage_Save(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected2 := "---\nname: documents/docs.cloud.google.com/test/page2\nuri: https://docs.cloud.google.com/test/page2\ntitle: Page 2\nupdate_time: \"2026-05-08T21:32:47Z\"\n---\n\nContent 2\n"
+	expected2 := "---\nname: documents/docs.cloud.google.com/test/page2\nuri: https://docs.cloud.google.com/test/page2\ntitle: Page 2\n---\n\nContent 2\n"
 	if string(c2) != expected2 {
 		t.Errorf("Expected %q, got %q", expected2, string(c2))
 	}

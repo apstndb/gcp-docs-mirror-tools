@@ -53,22 +53,23 @@ func (s *stringSlice) Set(value string) error {
 }
 
 type Config struct {
-	APIKey         string        `toml:"-"`
-	DocsDir        string        `toml:"docs_dir"`
-	LogDir         string        `toml:"log_dir"`
-	MetadataFile   string        `toml:"metadata_file"`
-	Recursive      bool          `toml:"recursive"`
-	Refresh        bool          `toml:"refresh"`
-	Resume         bool          `toml:"resume"`
-	Discovery      bool          `toml:"discovery"`
-	Verbose        bool          `toml:"verbose"`
-	Prefixes       []string      `toml:"prefixes"`
-	Seeds          []string      `toml:"seeds"`
-	Sitemaps       []string      `toml:"sitemaps"`
-	QuotaPerMinute float64       `toml:"qpm"`
-	QuotaWait      time.Duration `toml:"qw"`
-	SpannerDB      string        `toml:"spanner_db"`
-	StallTimeout   time.Duration `toml:"stall_timeout"`
+	APIKey            string        `toml:"-"`
+	DocsDir           string        `toml:"docs_dir"`
+	LogDir            string        `toml:"log_dir"`
+	MetadataFile      string        `toml:"metadata_file"`
+	Recursive         bool          `toml:"recursive"`
+	Refresh           bool          `toml:"refresh"`
+	Resume            bool          `toml:"resume"`
+	Discovery         bool          `toml:"discovery"`
+	Verbose           bool          `toml:"verbose"`
+	IncludeUpdateTime bool          `toml:"include_update_time"`
+	Prefixes          []string      `toml:"prefixes"`
+	Seeds             []string      `toml:"seeds"`
+	Sitemaps          []string      `toml:"sitemaps"`
+	QuotaPerMinute    float64       `toml:"qpm"`
+	QuotaWait         time.Duration `toml:"qw"`
+	SpannerDB         string        `toml:"spanner_db"`
+	StallTimeout      time.Duration `toml:"stall_timeout"`
 }
 
 func DefaultConfig() *Config {
@@ -93,8 +94,9 @@ type Storage interface {
 }
 
 type DiskStorage struct {
-	docsDir string
-	logDir  string
+	docsDir           string
+	logDir            string
+	includeUpdateTime bool
 }
 
 func (s *DiskStorage) Save(docs ...Document) error {
@@ -104,7 +106,7 @@ func (s *DiskStorage) Save(docs ...Document) error {
 		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 			return err
 		}
-		content, err := formatDocumentForStorage(doc)
+		content, err := formatDocumentForStorage(doc, s.includeUpdateTime)
 		if err != nil {
 			return err
 		}
@@ -229,6 +231,7 @@ func main() {
 	flag.BoolVar(&cfg.Resume, "resume", cfg.Resume, "Resume from existing progress in logs")
 	flag.BoolVar(&cfg.Discovery, "discovery", cfg.Discovery, "Discover more links from HTML navigation")
 	flag.BoolVar(&cfg.Verbose, "v", cfg.Verbose, "Enable verbose logging")
+	flag.BoolVar(&cfg.IncludeUpdateTime, "include-update-time", cfg.IncludeUpdateTime, "Include update_time in YAML frontmatter")
 	flag.Float64Var(&cfg.QuotaPerMinute, "qpm", cfg.QuotaPerMinute, "Quota per minute")
 	flag.DurationVar(&cfg.QuotaWait, "qw", cfg.QuotaWait, "Wait duration when quota is exceeded")
 	flag.DurationVar(&cfg.StallTimeout, "stall-timeout", cfg.StallTimeout, "Max duration without activity before aborting")
@@ -272,7 +275,11 @@ func main() {
 			os.Exit(1)
 		}
 	} else {
-		storage = &DiskStorage{docsDir: cfg.DocsDir, logDir: cfg.LogDir}
+		storage = &DiskStorage{
+			docsDir:           cfg.DocsDir,
+			logDir:            cfg.LogDir,
+			includeUpdateTime: cfg.IncludeUpdateTime,
+		}
 	}
 
 	app := &MirrorApp{

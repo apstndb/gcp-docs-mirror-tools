@@ -21,7 +21,7 @@ func TestFormatDocumentForStorage(t *testing.T) {
 		Content:     "# Spanner\n",
 	}
 
-	got, err := formatDocumentForStorage(doc)
+	got, err := formatDocumentForStorage(doc, false)
 	if err != nil {
 		t.Fatalf("formatDocumentForStorage() error = %v", err)
 	}
@@ -42,7 +42,6 @@ func TestFormatDocumentForStorage(t *testing.T) {
 		"title":       `Spanner: "Overview"`,
 		"description": "Line 1\nLine 2",
 		"data_source": "docs.cloud.google.com",
-		"update_time": "2026-05-08T21:32:47Z",
 	}
 	if !reflect.DeepEqual(meta, wantMeta) {
 		t.Fatalf("frontmatter = %#v, want %#v", meta, wantMeta)
@@ -52,6 +51,23 @@ func TestFormatDocumentForStorage(t *testing.T) {
 	}
 	if !strings.Contains(got, "\n# Spanner\n") {
 		t.Fatalf("formatted content missing body: %q", got)
+	}
+}
+
+func TestFormatDocumentForStorageIncludesUpdateTimeWhenEnabled(t *testing.T) {
+	doc := Document{
+		Name:       "documents/docs.cloud.google.com/spanner/docs",
+		URI:        "https://docs.cloud.google.com/spanner/docs",
+		UpdateTime: "2026-05-08T21:32:47Z",
+		Content:    "# Spanner\n",
+	}
+
+	got, err := formatDocumentForStorage(doc, true)
+	if err != nil {
+		t.Fatalf("formatDocumentForStorage() error = %v", err)
+	}
+	if !strings.Contains(got, "update_time: \"2026-05-08T21:32:47Z\"\n") {
+		t.Fatalf("formatted content missing update_time: %q", got)
 	}
 }
 

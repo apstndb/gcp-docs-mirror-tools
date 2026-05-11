@@ -16,14 +16,16 @@ type documentFrontmatter struct {
 	UpdateTime  string `yaml:"update_time,omitempty"`
 }
 
-func formatDocumentForStorage(doc Document) (string, error) {
+func formatDocumentForStorage(doc Document, includeUpdateTime bool) (string, error) {
 	meta := documentFrontmatter{
 		Name:        doc.Name,
 		URI:         doc.URI,
 		Title:       doc.Title,
 		Description: doc.Description,
 		DataSource:  doc.DataSource,
-		UpdateTime:  doc.UpdateTime,
+	}
+	if includeUpdateTime {
+		meta.UpdateTime = doc.UpdateTime
 	}
 	buf, err := yaml.Marshal(meta)
 	if err != nil {

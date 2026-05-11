@@ -55,6 +55,7 @@ gcp-docs-mirror -r -qpm 50 -prefix "/spanner/,/sdk/gcloud/" https://cloud.google
 | `-v` | Enable verbose logging | `false` |
 | `-r` | Enable recursive discovery from Markdown content | `false` |
 | `-f` | Refresh existing documents | `false` |
+| `-include-update-time` | Include `update_time` in YAML frontmatter | `false` |
 | `-qw` | Wait duration when quota is exceeded | `1m10s` |
 | `-docs` | Output directory for documents | `docs` |
 | `-logs` | Directory for log files | `logs` |
@@ -70,17 +71,19 @@ prefixes = ["/spanner/", "/sdk/gcloud/reference/spanner/"]
 recursive = true
 qpm = 50.0
 qw = "70s"
+# include_update_time = true
 ```
 
 ## Output
-File-based mirrors are written as Markdown with YAML frontmatter. The frontmatter currently includes:
+File-based mirrors are written as Markdown with YAML frontmatter. By default the frontmatter includes:
 
 - `name`
 - `uri`
 - `title`
 - `description`
 - `data_source`
-- `update_time`
+
+Set `-include-update-time` or `include_update_time = true` if you also want `update_time`.
 
 ## License
 MIT
