@@ -70,6 +70,40 @@ type Config struct {
 	QuotaWait         time.Duration `toml:"qw"`
 	SpannerDB         string        `toml:"spanner_db"`
 	StallTimeout      time.Duration `toml:"stall_timeout"`
+	// ExtraHosts appends to the default Developer Knowledge corpus hosts.
+	ExtraHosts []string `toml:"extra_hosts"`
+	// DefaultHost is the host assumed for relative links and path-only prefixes.
+	DefaultHost string `toml:"default_host"`
+}
+
+// defaultKnownHosts returns the Developer Knowledge API corpus domains.
+// Source: https://developers.google.com/knowledge/reference/corpus-reference
+func defaultKnownHosts() []string {
+	return []string{
+		"adk.dev",
+		"ai.google.dev",
+		"antigravity.google",
+		"developer.android.com",
+		"developer.chrome.com",
+		"developers.google.com",
+		"developers.home.google.com",
+		"docs.apigee.com",
+		"docs.cloud.google.com",
+		"firebase.google.com",
+		"fuchsia.dev",
+		"geminicli.com",
+		"go.dev",
+		"web.dev",
+		"www.tensorflow.org",
+	}
+}
+
+// defaultHostAliases maps legacy or alternate hostnames to their canonical
+// Developer Knowledge corpus host.
+func defaultHostAliases() map[string]string {
+	return map[string]string{
+		"cloud.google.com": "docs.cloud.google.com",
+	}
 }
 
 func DefaultConfig() *Config {
@@ -85,6 +119,7 @@ func DefaultConfig() *Config {
 		QuotaPerMinute: 50.0,
 		QuotaWait:      70 * time.Second,
 		StallTimeout:   0,
+		DefaultHost:    "docs.cloud.google.com",
 	}
 }
 
@@ -160,6 +195,12 @@ type MirrorApp struct {
 	redirects     map[string]string
 	failedURLs    map[string]int // URL -> HTTP StatusCode
 	mdParser      goldmark.Markdown
+
+	// Host handling
+	knownHosts  map[string]bool   // canonical hosts accepted by the corpus
+	hostAliases map[string]string // legacy host -> canonical host
+	defaultHost string            // host used when none is encoded in the input
+	prefixRules []prefixRule      // parsed cfg.Prefixes
 
 	// Shared HTTP clients
 	apiHTTPClient    *http.Client
@@ -299,6 +340,28 @@ func main() {
 		}
 	}
 
+	knownHosts := make(map[string]bool)
+	for _, h := range defaultKnownHosts() {
+		knownHosts[h] = true
+	}
+	for _, h := range cfg.ExtraHosts {
+		if h = strings.TrimSpace(h); h != "" {
+			knownHosts[h] = true
+		}
+	}
+	hostAliases := defaultHostAliases()
+	defaultHost := cfg.DefaultHost
+	if defaultHost == "" {
+		defaultHost = "docs.cloud.google.com"
+	}
+	if !knownHosts[defaultHost] {
+		if canon, ok := hostAliases[defaultHost]; ok {
+			defaultHost = canon
+		} else {
+			knownHosts[defaultHost] = true
+		}
+	}
+
 	app := &MirrorApp{
 		cfg:           cfg,
 		storage:       storage,
@@ -307,6 +370,9 @@ func main() {
 		redirects:     make(map[string]string),
 		failedURLs:    make(map[string]int),
 		mdParser:      goldmark.New(),
+		knownHosts:    knownHosts,
+		hostAliases:   hostAliases,
+		defaultHost:   defaultHost,
 		apiHTTPClient: apiHTTPClient,
 		httpClient:    &http.Client{Timeout: 30 * time.Second},
 		noRedirectClient: &http.Client{
@@ -325,6 +391,7 @@ func main() {
 		lastWindowUpdate: time.Now().Unix(),
 		isCI:             os.Getenv("CI") == "true",
 	}
+	app.prefixRules = app.parsePrefixes(cfg.Prefixes)
 
 	stopProgress := make(chan struct{})
 	progressDone := make(chan struct{})
@@ -596,8 +663,9 @@ func (a *MirrorApp) enqueueBatch(urls []string, wg *sync.WaitGroup) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	var discovered, skipped int32
-	for _, u := range urls {
-		if !a.matchesAnyPrefix(u) {
+	for _, raw := range urls {
+		u := a.resolveAndNormalize(raw, "")
+		if u == "" || !a.matchesAnyPrefix(u) {
 			continue
 		}
 		if a.sessionQueued[u] {
@@ -739,11 +807,10 @@ func (a *MirrorApp) fetchAndExtractLinks(u string, targetClasses []string) []str
 		return nil
 	}
 	defer resp.Body.Close()
-	actualURL := resp.Request.URL.String()
-	basePath := a.toRootRelative(actualURL)
+	baseURL := a.resolveAndNormalize(resp.Request.URL.String(), "")
 	var results []string
 	for _, l := range a.extractLinksWithClassFilter(resp.Body, targetClasses) {
-		if normalized := a.resolveAndNormalize(l, basePath); normalized != "" && a.matchesAnyPrefix(normalized) {
+		if normalized := a.resolveAndNormalize(l, baseURL); normalized != "" && a.matchesAnyPrefix(normalized) {
 			results = append(results, normalized)
 		}
 	}
@@ -800,11 +867,18 @@ func (a *MirrorApp) discoverLinksFromMirror() []string {
 			return nil
 		}
 		relToDocs, _ := filepath.Rel(a.cfg.DocsDir, fpath)
-		relToDocs = strings.TrimSuffix(relToDocs, ".md")
-		basePath := "/" + strings.TrimPrefix(relToDocs, "docs.cloud.google.com/")
+		relToDocs = filepath.ToSlash(strings.TrimSuffix(relToDocs, ".md"))
+		host, rest, _ := strings.Cut(relToDocs, "/")
+		canonicalHost := a.canonicalHost(host)
+		if canonicalHost == "" {
+			// Legacy layout without a host directory: treat as default host.
+			canonicalHost = a.defaultHost
+			rest = relToDocs
+		}
+		baseURL := a.makeCanonical(canonicalHost, "/"+rest)
 		content, _ := os.ReadFile(fpath)
 		for _, l := range a.extractLinksFromMarkdown(content) {
-			if normalized := a.resolveAndNormalize(l, basePath); normalized != "" && !a.isProcessedSession(normalized) && a.matchesAnyPrefix(normalized) {
+			if normalized := a.resolveAndNormalize(l, baseURL); normalized != "" && !a.isProcessedSession(normalized) && a.matchesAnyPrefix(normalized) {
 				allDiscovered = append(allDiscovered, normalized)
 			}
 		}
@@ -813,48 +887,178 @@ func (a *MirrorApp) discoverLinksFromMirror() []string {
 	return allDiscovered
 }
 
-func (a *MirrorApp) resolveAndNormalize(link, basePath string) string {
-	if strings.Contains(link, "://") && !strings.Contains(link, "cloud.google.com") {
+// prefixRule represents a parsed prefix used for matching URLs.
+// When host is empty the rule matches any known host.
+type prefixRule struct {
+	host string
+	path string // always begins with "/"
+}
+
+func (a *MirrorApp) parsePrefixes(prefixes []string) []prefixRule {
+	rules := make([]prefixRule, 0, len(prefixes))
+	for _, p := range prefixes {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		rules = append(rules, a.parsePrefix(p))
+	}
+	return rules
+}
+
+func (a *MirrorApp) parsePrefix(p string) prefixRule {
+	if strings.HasPrefix(p, "/") {
+		return prefixRule{host: "", path: a.cleanPath(p)}
+	}
+	if h, pa := a.parseCanonical(p); h != "" {
+		return prefixRule{host: h, path: pa}
+	}
+	// Fallback: treat as a host-less path.
+	return prefixRule{host: "", path: a.cleanPath("/" + p)}
+}
+
+func (a *MirrorApp) canonicalHost(h string) string {
+	h = strings.ToLower(strings.TrimSpace(h))
+	if h == "" {
 		return ""
+	}
+	if alias, ok := a.hostAliases[h]; ok {
+		h = alias
+	}
+	if a.knownHosts[h] {
+		return h
+	}
+	return ""
+}
+
+// cleanPath returns a normalized URL path beginning with "/".
+// It strips the .md suffix and any trailing slash on non-root paths.
+func (a *MirrorApp) cleanPath(p string) string {
+	p = strings.Split(p, "#")[0]
+	p = strings.Split(p, "?")[0]
+	p = strings.TrimSuffix(p, ".md")
+	if p == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	p = path.Clean(p)
+	if p == "." {
+		p = "/"
+	}
+	return p
+}
+
+// parseCanonical parses a URL-like string and returns its canonical host
+// and cleaned path. Returns ("", "") when the host is not recognized.
+// Accepts inputs with or without an explicit scheme.
+func (a *MirrorApp) parseCanonical(u string) (host, urlPath string) {
+	u = strings.TrimSpace(u)
+	if u == "" {
+		return "", ""
+	}
+	// Protocol-relative
+	if strings.HasPrefix(u, "//") {
+		u = "https:" + u
+	}
+	// Bare host[/path] without scheme: detect and synthesize https://
+	if !strings.Contains(u, "://") {
+		head := u
+		if i := strings.Index(head, "/"); i >= 0 {
+			head = head[:i]
+		}
+		if a.canonicalHost(head) != "" {
+			u = "https://" + u
+		} else {
+			return "", ""
+		}
+	}
+	pu, err := url.Parse(u)
+	if err != nil || pu.Host == "" {
+		return "", ""
+	}
+	h := a.canonicalHost(pu.Hostname())
+	if h == "" {
+		return "", ""
+	}
+	return h, a.cleanPath(pu.Path)
+}
+
+// makeCanonical assembles a canonical URL from host and path.
+func (a *MirrorApp) makeCanonical(host, urlPath string) string {
+	if host == "" {
+		return ""
+	}
+	return "https://" + host + a.cleanPath(urlPath)
+}
+
+// urlPath returns the cleaned path component of u, or cleans u when no host
+// is present. Useful for prefix matching against a URL or a bare path.
+func (a *MirrorApp) urlPath(u string) string {
+	if h, p := a.parseCanonical(u); h != "" {
+		return p
+	}
+	return a.cleanPath(u)
+}
+
+// urlHost returns the canonical host of u, or "" if unknown.
+func (a *MirrorApp) urlHost(u string) string {
+	h, _ := a.parseCanonical(u)
+	return h
+}
+
+// resolveAndNormalize resolves link against baseURL (a canonical URL or
+// empty) and returns a canonical URL, or "" if the host is not recognized
+// or the link cannot be resolved.
+func (a *MirrorApp) resolveAndNormalize(link, baseURL string) string {
+	baseHost, basePath := a.parseCanonical(baseURL)
+	if baseHost == "" {
+		baseHost = a.defaultHost
+		basePath = "/"
 	}
 	link = strings.Split(link, "#")[0]
 	if link == "" {
-		return "https://docs.cloud.google.com" + a.toRootRelative(basePath)
+		return a.makeCanonical(baseHost, basePath)
 	}
-	rel := link
-	if strings.Contains(rel, "://") {
-		rel = a.toRootRelative(rel)
+	// Absolute URL (including protocol-relative).
+	if strings.Contains(link, "://") || strings.HasPrefix(link, "//") {
+		h, p := a.parseCanonical(link)
+		if h == "" {
+			return ""
+		}
+		return a.makeCanonical(h, p)
 	}
-	if !strings.HasPrefix(rel, "/") {
-		rel = path.Join(basePath, rel)
+	// Root-relative
+	if strings.HasPrefix(link, "/") {
+		return a.makeCanonical(baseHost, link)
 	}
-	return "https://docs.cloud.google.com" + a.toRootRelative(rel)
+	// Document-relative: existing convention treats basePath as a directory.
+	return a.makeCanonical(baseHost, path.Join(basePath, link))
 }
 
 func (a *MirrorApp) matchesAnyPrefix(u string) bool {
-	link := a.toRootRelative(u)
-	for _, p := range a.cfg.Prefixes {
-		cleanP := strings.TrimSuffix(p, "/")
-		if link == cleanP || strings.HasPrefix(link, cleanP+"/") {
+	uHost, uPath := a.parseCanonical(u)
+	if uHost == "" {
+		return false
+	}
+	rules := a.prefixRules
+	if len(rules) == 0 {
+		rules = a.parsePrefixes(a.cfg.Prefixes)
+	}
+	for _, r := range rules {
+		if r.host != "" && r.host != uHost {
+			continue
+		}
+		cleanP := strings.TrimSuffix(r.path, "/")
+		if cleanP == "" {
+			return true
+		}
+		if uPath == cleanP || strings.HasPrefix(uPath, cleanP+"/") {
 			return true
 		}
 	}
 	return false
-}
-
-func (a *MirrorApp) toRootRelative(u string) string {
-	u = strings.TrimPrefix(u, "https://docs.cloud.google.com")
-	u = strings.TrimPrefix(u, "https://cloud.google.com")
-	u = strings.TrimPrefix(u, "http://docs.cloud.google.com")
-	u = strings.TrimPrefix(u, "http://cloud.google.com")
-	u = strings.Split(u, "#")[0]
-	u = strings.Split(u, "?")[0]
-	u = strings.TrimSuffix(u, ".md")
-	u = path.Clean("/" + u)
-	if u == "." {
-		u = "/"
-	}
-	return u
 }
 
 func (a *MirrorApp) extractLinksFromMarkdown(source []byte) []string {
@@ -892,8 +1096,10 @@ func (a *MirrorApp) processBatchRecursive(urls []string, wg *sync.WaitGroup) err
 		a.mu.Lock()
 		processedMap := make(map[string]bool)
 		for _, doc := range docs {
-			relPath := strings.TrimPrefix(doc.Name, "documents/")
-			u := "https://docs.cloud.google.com/" + strings.TrimPrefix(relPath, "docs.cloud.google.com/")
+			u := a.apiNameToURL(doc.Name)
+			if u == "" {
+				continue
+			}
 			a.processedURLs[u] = true
 			a.updateTimes[u] = doc.UpdateTime
 			processedMap[u] = true
@@ -999,12 +1205,23 @@ func (a *MirrorApp) fetchDocs(urls []string) ([]Document, *APIError) {
 }
 
 func (a *MirrorApp) normalizeForAPI(u string) string {
-	name := strings.TrimPrefix(u, "https://")
-	name = strings.TrimPrefix(name, "http://")
-	if strings.HasPrefix(name, "cloud.google.com/") {
-		name = "docs.cloud.google.com/" + strings.TrimPrefix(name, "cloud.google.com/")
+	h, p := a.parseCanonical(u)
+	if h == "" {
+		// Fallback: treat the input as a path under the default host.
+		return "documents/" + a.defaultHost + a.cleanPath(u)
 	}
-	return "documents/" + name
+	return "documents/" + h + p
+}
+
+// apiNameToURL reverses normalizeForAPI: "documents/HOST/PATH" -> canonical URL.
+func (a *MirrorApp) apiNameToURL(name string) string {
+	rest := strings.TrimPrefix(name, "documents/")
+	host, pathPart, _ := strings.Cut(rest, "/")
+	h := a.canonicalHost(host)
+	if h == "" {
+		return ""
+	}
+	return a.makeCanonical(h, "/"+pathPart)
 }
 
 func (a *MirrorApp) handleLeafFailure(u string, wg *sync.WaitGroup) error {
@@ -1030,7 +1247,11 @@ func (a *MirrorApp) handleLeafFailure(u string, wg *sync.WaitGroup) error {
 			break
 		}
 		if strings.HasPrefix(loc, "/") {
-			loc = "https://docs.cloud.google.com" + loc
+			h := a.urlHost(curr)
+			if h == "" {
+				h = a.defaultHost
+			}
+			loc = "https://" + h + loc
 		}
 		curr = loc
 	}

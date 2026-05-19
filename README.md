@@ -72,7 +72,35 @@ recursive = true
 qpm = 50.0
 qw = "70s"
 # include_update_time = true
+
+# default_host is used for relative links and path-only prefixes.
+# Defaults to "docs.cloud.google.com".
+# default_host = "developers.google.com"
+
+# extra_hosts adds host(s) on top of the built-in Developer Knowledge corpus.
+# Leave unset unless mirroring an undocumented host.
+# extra_hosts = ["example.googleapis.com"]
 ```
+
+### Supported hosts
+
+By default the tool accepts URLs from every domain in the [Developer Knowledge API corpus](https://developers.google.com/knowledge/reference/corpus-reference):
+
+- `adk.dev`, `ai.google.dev`, `antigravity.google`
+- `developer.android.com`, `developer.chrome.com`
+- `developers.google.com`, `developers.home.google.com`
+- `docs.apigee.com`, `docs.cloud.google.com`
+- `firebase.google.com`, `fuchsia.dev`
+- `geminicli.com`, `go.dev`, `web.dev`, `www.tensorflow.org`
+
+`cloud.google.com` is aliased to `docs.cloud.google.com` for backward compatibility.
+
+### Prefix syntax
+
+`prefixes` accepts either:
+
+- a **path-only prefix** like `/spanner/docs/`, which matches any known host (use this with `default_host` when you only mirror one host); or
+- a **host-scoped prefix** like `developers.google.com/gemini-code-assist/`, which matches only that host.
 
 ## Output
 File-based mirrors are written as Markdown with YAML frontmatter. By default the frontmatter includes:

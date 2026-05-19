@@ -3,7 +3,7 @@
 This document provides architectural context and technical guidelines for AI agents working on this repository.
 
 ## Project Purpose
-A high-performance tool to mirror Google Cloud documentation in Markdown format using the **Developer Knowledge API**. It supports recursive discovery, sitemap parsing, and multi-mode storage (Local Disk or Cloud Spanner).
+A high-performance tool to mirror Google developer documentation in Markdown format using the **Developer Knowledge API**. It supports the full Developer Knowledge corpus (15 hosts including `docs.cloud.google.com`, `developers.google.com`, `firebase.google.com`, etc.), recursive discovery, sitemap parsing, and multi-mode storage (Local Disk or Cloud Spanner).
 
 ## Core Architecture
 
@@ -35,9 +35,9 @@ The Developer Knowledge API has a `batchGet` limit (20). If a batch request fail
   - **Search Index**: Uses `TOKENLIST` and `TOKENIZE_FULLTEXT` on the `ContentString`. It is confirmed that `SEARCH INDEX` can use `STORING` with virtual generated columns (like `ContentString`).
 
 ## Key Data Models
-- **`Config`**: TOML/Flag-based configuration.
-- **`Document`**: Name (API format `documents/docs.cloud.google.com/...`) and raw Markdown content.
-- **URL Normalization**: URLs are always normalized to `https://docs.cloud.google.com/...` with trailing slashes and `.md` extensions removed.
+- **`Config`**: TOML/Flag-based configuration. Includes `default_host` and `extra_hosts` for the multi-host corpus.
+- **`Document`**: Name (API format `documents/HOST/PATH`) and raw Markdown content.
+- **URL Normalization**: URLs are normalized to `https://HOST/PATH` against the known Developer Knowledge corpus hosts (`defaultKnownHosts()` in `main.go`). `cloud.google.com` is aliased to `docs.cloud.google.com`. Trailing slashes, query strings, fragments, and `.md` extensions are stripped.
 
 ## Technical Findings & Constraints
 
@@ -53,7 +53,11 @@ When using `BatchWrite`, always ensure the `mutation_groups` indices align perfe
 ## Development Workflows
 
 ### URL Normalization Rules
-Always use `toRootRelative` and `resolveAndNormalize` for consistent URL handling. The API expects `documents/docs.cloud.google.com/PATH`.
+Always use `parseCanonical`, `resolveAndNormalize`, `urlPath`, `urlHost`, and `normalizeForAPI` for URL handling. The API expects `documents/HOST/PATH` where HOST is one of the canonical hosts in `defaultKnownHosts()`. Use `apiNameToURL` to reverse-map API document names to canonical URLs.
+
+Prefix matching:
+- `/path/` (path-only) matches under any known host. Pair with `default_host` for single-host mirrors.
+- `host/path/` (host-scoped) matches only that specific host.
 
 ### Authentication
 Prefer `DEVELOPERKNOWLEDGE_API_KEY` or `GOOGLE_API_KEY`. If neither is set, use ADC. Local `authorized_user` ADC requires a quota project via `GOOGLE_CLOUD_QUOTA_PROJECT` or `gcloud auth application-default set-quota-project`.

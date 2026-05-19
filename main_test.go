@@ -11,8 +11,23 @@ import (
 	"github.com/yuin/goldmark"
 )
 
-func TestToRootRelative(t *testing.T) {
-	app := &MirrorApp{}
+func newTestApp(prefixes ...string) *MirrorApp {
+	knownHosts := make(map[string]bool)
+	for _, h := range defaultKnownHosts() {
+		knownHosts[h] = true
+	}
+	app := &MirrorApp{
+		cfg:         &Config{Prefixes: prefixes},
+		knownHosts:  knownHosts,
+		hostAliases: defaultHostAliases(),
+		defaultHost: "docs.cloud.google.com",
+	}
+	app.prefixRules = app.parsePrefixes(prefixes)
+	return app
+}
+
+func TestURLPath(t *testing.T) {
+	app := newTestApp()
 	tests := []struct {
 		input    string
 		expected string
@@ -21,31 +36,63 @@ func TestToRootRelative(t *testing.T) {
 		{"https://cloud.google.com/spanner/docs/", "/spanner/docs"},
 		{"https://docs.cloud.google.com/spanner/docs/dml-versus-mutations.md", "/spanner/docs/dml-versus-mutations"},
 		{"http://docs.cloud.google.com/spanner/docs#anchor", "/spanner/docs"},
+		{"https://developers.google.com/gemini-code-assist/docs/overview", "/gemini-code-assist/docs/overview"},
 		{"/spanner/docs/backup/", "/spanner/docs/backup"},
 		{"spanner/docs", "/spanner/docs"},
 	}
 
 	for _, tt := range tests {
-		result := app.toRootRelative(tt.input)
+		result := app.urlPath(tt.input)
 		if result != tt.expected {
-			t.Errorf("toRootRelative(%q) = %q; want %q", tt.input, result, tt.expected)
+			t.Errorf("urlPath(%q) = %q; want %q", tt.input, result, tt.expected)
+		}
+	}
+}
+
+func TestCanonicalHost(t *testing.T) {
+	app := newTestApp()
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"docs.cloud.google.com", "docs.cloud.google.com"},
+		{"cloud.google.com", "docs.cloud.google.com"},
+		{"developers.google.com", "developers.google.com"},
+		{"DOCS.CLOUD.GOOGLE.COM", "docs.cloud.google.com"},
+		{"example.com", ""},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		got := app.canonicalHost(tt.input)
+		if got != tt.expected {
+			t.Errorf("canonicalHost(%q) = %q; want %q", tt.input, got, tt.expected)
 		}
 	}
 }
 
 func TestResolveAndNormalize(t *testing.T) {
-	app := &MirrorApp{}
+	app := newTestApp()
 	tests := []struct {
 		link     string
 		base     string
 		expected string
 	}{
-		{"concepts", "/spanner/docs", "https://docs.cloud.google.com/spanner/docs/concepts"},
-		{"backup/", "/spanner/docs", "https://docs.cloud.google.com/spanner/docs/backup"},
-		{"dml-versus-mutations.md", "/spanner/docs", "https://docs.cloud.google.com/spanner/docs/dml-versus-mutations"},
-		{"/spanner/docs/concepts/", "/irrelevant", "https://docs.cloud.google.com/spanner/docs/concepts"},
-		{"https://cloud.google.com/spanner/docs/", "/any", "https://docs.cloud.google.com/spanner/docs"},
-		{"#anchor", "/spanner/docs", "https://docs.cloud.google.com/spanner/docs"},
+		{"concepts", "https://docs.cloud.google.com/spanner/docs", "https://docs.cloud.google.com/spanner/docs/concepts"},
+		{"backup/", "https://docs.cloud.google.com/spanner/docs", "https://docs.cloud.google.com/spanner/docs/backup"},
+		{"dml-versus-mutations.md", "https://docs.cloud.google.com/spanner/docs", "https://docs.cloud.google.com/spanner/docs/dml-versus-mutations"},
+		{"/spanner/docs/concepts/", "https://docs.cloud.google.com/irrelevant", "https://docs.cloud.google.com/spanner/docs/concepts"},
+		{"https://cloud.google.com/spanner/docs/", "https://docs.cloud.google.com/any", "https://docs.cloud.google.com/spanner/docs"},
+		{"#anchor", "https://docs.cloud.google.com/spanner/docs", "https://docs.cloud.google.com/spanner/docs"},
+		// developers.google.com support
+		{"set-up-gemini", "https://developers.google.com/gemini-code-assist/docs/overview", "https://developers.google.com/gemini-code-assist/docs/overview/set-up-gemini"},
+		{"/gemini-code-assist/docs/quotas", "https://developers.google.com/anything", "https://developers.google.com/gemini-code-assist/docs/quotas"},
+		{"https://developers.google.com/gemini-code-assist/docs/overview", "", "https://developers.google.com/gemini-code-assist/docs/overview"},
+		// Cross-host absolute link preserves its host.
+		{"https://docs.cloud.google.com/gemini/docs", "https://developers.google.com/gemini-code-assist/docs/overview", "https://docs.cloud.google.com/gemini/docs"},
+		// Unknown host rejected.
+		{"https://example.com/foo", "https://docs.cloud.google.com/spanner/docs", ""},
+		// Empty base falls back to default host for relative paths.
+		{"/spanner/docs", "", "https://docs.cloud.google.com/spanner/docs"},
 	}
 
 	for _, tt := range tests {
@@ -57,7 +104,7 @@ func TestResolveAndNormalize(t *testing.T) {
 }
 
 func TestNormalizeForAPI(t *testing.T) {
-	app := &MirrorApp{}
+	app := newTestApp()
 	tests := []struct {
 		input    string
 		expected string
@@ -65,6 +112,8 @@ func TestNormalizeForAPI(t *testing.T) {
 		{"https://docs.cloud.google.com/spanner/docs", "documents/docs.cloud.google.com/spanner/docs"},
 		{"https://cloud.google.com/spanner/docs", "documents/docs.cloud.google.com/spanner/docs"},
 		{"cloud.google.com/spanner/docs", "documents/docs.cloud.google.com/spanner/docs"},
+		{"https://developers.google.com/gemini-code-assist/docs/overview", "documents/developers.google.com/gemini-code-assist/docs/overview"},
+		{"developers.google.com/gemini-code-assist/docs", "documents/developers.google.com/gemini-code-assist/docs"},
 	}
 
 	for _, tt := range tests {
@@ -75,12 +124,26 @@ func TestNormalizeForAPI(t *testing.T) {
 	}
 }
 
-func TestMatchesAnyPrefix(t *testing.T) {
-	app := &MirrorApp{
-		cfg: &Config{
-			Prefixes: []string{"/spanner/docs", "/sdk/gcloud/reference/spanner"},
-		},
+func TestAPINameToURL(t *testing.T) {
+	app := newTestApp()
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"documents/docs.cloud.google.com/spanner/docs", "https://docs.cloud.google.com/spanner/docs"},
+		{"documents/developers.google.com/gemini-code-assist/docs/overview", "https://developers.google.com/gemini-code-assist/docs/overview"},
+		{"documents/example.com/foo", ""},
 	}
+	for _, tt := range tests {
+		got := app.apiNameToURL(tt.input)
+		if got != tt.expected {
+			t.Errorf("apiNameToURL(%q) = %q; want %q", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestMatchesAnyPrefix(t *testing.T) {
+	app := newTestApp("/spanner/docs", "/sdk/gcloud/reference/spanner", "developers.google.com/gemini-code-assist/")
 	tests := []struct {
 		input    string
 		expected bool
@@ -90,6 +153,13 @@ func TestMatchesAnyPrefix(t *testing.T) {
 		{"https://docs.cloud.google.com/sdk/gcloud/reference/spanner", true},
 		{"https://docs.cloud.google.com/sdk/gcloud/reference/spanner/describe", true},
 		{"https://docs.cloud.google.com/bigtable/docs", false},
+		// Host-scoped prefix.
+		{"https://developers.google.com/gemini-code-assist/docs/overview", true},
+		{"https://developers.google.com/other-product/docs", false},
+		// Host-scoped prefix doesn't match the wrong host.
+		{"https://docs.cloud.google.com/gemini-code-assist/docs", false},
+		// Unknown host rejected.
+		{"https://example.com/spanner/docs", false},
 	}
 
 	for _, tt := range tests {
@@ -174,41 +244,40 @@ func TestExtractLinksWithClassFilter(t *testing.T) {
 }
 
 func TestEnqueueBatch(t *testing.T) {
-	app := &MirrorApp{
-		cfg: &Config{
-			Prefixes: []string{"/allowed"},
-		},
-		processedURLs: make(map[string]bool),
-		failedURLs:    make(map[string]int),
-		redirects:     make(map[string]string),
-		sessionQueued: make(map[string]bool),
-		queueChan:     make(chan string, 10),
-	}
+	app := newTestApp("/allowed")
+	app.processedURLs = make(map[string]bool)
+	app.failedURLs = make(map[string]int)
+	app.redirects = make(map[string]string)
+	app.sessionQueued = make(map[string]bool)
+	app.queueChan = make(chan string, 10)
 
 	var wg sync.WaitGroup
 	urls := []string{
 		"https://docs.cloud.google.com/allowed/1",
 		"https://docs.cloud.google.com/allowed/1", // Duplicate in same batch
+		"https://cloud.google.com/allowed/1",      // Same after host canonicalization
 		"https://docs.cloud.google.com/blocked/1", // Wrong prefix
+		"https://developers.google.com/allowed/1", // Path matches; allowed across hosts.
 	}
 
 	app.enqueueBatch(urls, &wg)
 
-	// Verify deduplication and prefix filtering
-	if len(app.queueChan) != 1 {
-		t.Errorf("Expected 1 URL in queue, got %d", len(app.queueChan))
+	if len(app.queueChan) != 2 {
+		t.Fatalf("Expected 2 URLs in queue, got %d", len(app.queueChan))
 	}
-
-	// Verify WaitGroup was incremented correctly
-	// We can't directly check the internal counter of WaitGroup,
-	// but we can try to call Done() and see if it's correct.
-	// However, a better way is to see if we can read from the channel and then Wait().
-	u := <-app.queueChan
-	if u != "https://docs.cloud.google.com/allowed/1" {
-		t.Errorf("Expected allowed/1, got %q", u)
+	got := []string{<-app.queueChan, <-app.queueChan}
+	want := map[string]bool{
+		"https://docs.cloud.google.com/allowed/1": true,
+		"https://developers.google.com/allowed/1": true,
+	}
+	for _, u := range got {
+		if !want[u] {
+			t.Errorf("Unexpected URL in queue: %q", u)
+		}
 	}
 	wg.Done()
-	wg.Wait() // Should not hang if Add(1) was called exactly once
+	wg.Done()
+	wg.Wait()
 }
 
 func TestDiskStorage_Save(t *testing.T) {
