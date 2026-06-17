@@ -1124,9 +1124,14 @@ func (a *MirrorApp) processBatchRecursive(urls []string, wg *sync.WaitGroup) err
 		return nil
 	}
 	mid := len(urls) / 2
-	go a.processBatchRecursive(urls[:mid], wg)
-	go a.processBatchRecursive(urls[mid:], wg)
-	return nil
+	errs := make(chan error, 2)
+	go func() {
+		errs <- a.processBatchRecursive(urls[:mid], wg)
+	}()
+	go func() {
+		errs <- a.processBatchRecursive(urls[mid:], wg)
+	}()
+	return errors.Join(<-errs, <-errs)
 }
 
 func (a *MirrorApp) finishBatchAPIError(urls []string, wg *sync.WaitGroup, err error) {
