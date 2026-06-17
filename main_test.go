@@ -1,14 +1,21 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/yuin/goldmark"
+	"golang.org/x/time/rate"
 )
 
 func newTestApp(prefixes ...string) *MirrorApp {
@@ -24,6 +31,104 @@ func newTestApp(prefixes ...string) *MirrorApp {
 	}
 	app.prefixRules = app.parsePrefixes(prefixes)
 	return app
+}
+
+type mirrorRoundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f mirrorRoundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func newFetchTestApp(rt http.RoundTripper) *MirrorApp {
+	app := newTestApp()
+	app.ctx = context.Background()
+	app.cfg.QuotaWait = time.Hour
+	app.apiHTTPClient = &http.Client{Transport: rt}
+	app.apiSem = make(chan struct{}, 1)
+	app.limiter = rate.NewLimiter(rate.Inf, 1)
+	app.failedURLs = make(map[string]int)
+	app.processedURLs = make(map[string]bool)
+	app.updateTimes = make(map[string]string)
+	app.redirects = make(map[string]string)
+	app.startTime = time.Now()
+	app.lastActivity = time.Now().UnixNano()
+	app.isCI = true
+	return app
+}
+
+func TestProcessBatchRecursiveDoesNotBisectNonDocumentAPIError(t *testing.T) {
+	var requests int32
+	app := newFetchTestApp(mirrorRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		atomic.AddInt32(&requests, 1)
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Body: io.NopCloser(strings.NewReader(`{
+				"error": {
+					"code": 500,
+					"message": "backend unavailable",
+					"status": "INTERNAL"
+				}
+			}`)),
+		}, nil
+	}))
+
+	urls := []string{
+		"https://docs.cloud.google.com/spanner/docs/a",
+		"https://docs.cloud.google.com/spanner/docs/b",
+	}
+	var wg sync.WaitGroup
+	wg.Add(len(urls))
+	atomic.StoreInt32(&app.inflightCount, int32(len(urls)))
+
+	err := app.processBatchRecursive(urls, &wg)
+	if err == nil {
+		t.Fatal("expected non-bisectable API error")
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Fatalf("requests = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&app.failedCount); got != int32(len(urls)) {
+		t.Fatalf("failedCount = %d, want %d", got, len(urls))
+	}
+	if got := atomic.LoadInt32(&app.finishedCount); got != int32(len(urls)) {
+		t.Fatalf("finishedCount = %d, want %d", got, len(urls))
+	}
+	if got := atomic.LoadInt32(&app.inflightCount); got != 0 {
+		t.Fatalf("inflightCount = %d, want 0", got)
+	}
+	for _, u := range urls {
+		if got := app.failedURLs[u]; got != -1 {
+			t.Fatalf("failedURLs[%q] = %d, want -1", u, got)
+		}
+	}
+}
+
+func TestFetchDocsWithRetryCancelsQuotaWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var requests int32
+	app := newFetchTestApp(mirrorRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		atomic.AddInt32(&requests, 1)
+		cancel()
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Retry-After": []string{"3600"}},
+			Body:       io.NopCloser(strings.NewReader("")),
+		}, nil
+	}))
+	app.ctx = ctx
+
+	_, err := app.fetchDocsWithRetry([]string{"https://docs.cloud.google.com/spanner/docs"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Fatalf("requests = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&app.isWaitingQuota); got != 0 {
+		t.Fatalf("isWaitingQuota = %d, want 0", got)
+	}
 }
 
 func TestURLPath(t *testing.T) {
