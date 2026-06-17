@@ -1190,7 +1190,7 @@ func (a *MirrorApp) fetchDocs(urls []string) ([]Document, error) {
 		APIKey:     a.cfg.APIKey,
 		HTTPClient: a.apiHTTPClient,
 		Context:    a.context(),
-		MaxRetries: 1,
+		MaxRetries: 0,
 	}
 	return client.BatchGetDocuments(names)
 }

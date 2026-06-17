@@ -24,8 +24,8 @@ github.com/GoogleCloudPlatform/grpc-gcp-go/grpcgcp v1.6.0 h1:BzsL0qE7LvtTEtXG7Dt
 github.com/GoogleCloudPlatform/grpc-gcp-go/grpcgcp v1.6.0/go.mod h1:I7kE2kM3qCr9QPT4cU4cCFYkEpVyVr16YOGUHzy+nR0=
 github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.30.0 h1:sBEjpZlNHzK1voKq9695PJSX2o5NEXl7/OL3coiIY0c=
 github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.30.0/go.mod h1:P4WPRUkOhJC13W//jWpyfJNDAIpvRbAUIYLX/4jtlE0=
-github.com/apstndb/developerknowledge-go v0.1.0 h1:hM9hg5pueJ3xvN3ZqLbjuN7sz+YsPVHQGL++z1r5UCE=
-github.com/apstndb/developerknowledge-go v0.1.0/go.mod h1:SkrYUXrudPdwg//GnGSnLsjYilMI+9n2+TGUuHo/CcE=
+github.com/apstndb/developerknowledge-go v0.1.1 h1:5sL7fPVV464Q1to31DdZQCnG4SAIESYRs7+m1J9zUqY=
+github.com/apstndb/developerknowledge-go v0.1.1/go.mod h1:SkrYUXrudPdwg//GnGSnLsjYilMI+9n2+TGUuHo/CcE=
 github.com/census-instrumentation/opencensus-proto v0.2.1/go.mod h1:f6KPmirojxKA12rnyqOA5BBL4O983OfeGPqjHWSTneU=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
