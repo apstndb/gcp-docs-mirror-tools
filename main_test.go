@@ -238,6 +238,9 @@ func TestFetchDocsHonorsContextWhileWaitingForAPISem(t *testing.T) {
 	if got := atomic.LoadInt32(&requests); got != 0 {
 		t.Fatalf("requests = %d, want 0", got)
 	}
+	if got := atomic.LoadInt32(&app.apiReqCount); got != 0 {
+		t.Fatalf("apiReqCount = %d, want 0", got)
+	}
 }
 
 func TestFetchDocsHonorsContextWhileWaitingForRateLimiter(t *testing.T) {
@@ -279,6 +282,9 @@ func TestFetchDocsHonorsContextWhileWaitingForRateLimiter(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&requests); got != 0 {
 		t.Fatalf("requests = %d, want 0", got)
+	}
+	if got := atomic.LoadInt32(&app.apiReqCount); got != 0 {
+		t.Fatalf("apiReqCount = %d, want 0", got)
 	}
 	if got := atomic.LoadInt32(&app.isWaitingQuota); got != 0 {
 		t.Fatalf("isWaitingQuota = %d, want 0", got)

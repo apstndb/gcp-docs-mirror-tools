@@ -1136,7 +1136,14 @@ func (a *MirrorApp) processBatchRecursive(ctx context.Context, urls []string, wg
 	go func() {
 		errs <- a.processBatchRecursive(ctx, urls[mid:], wg)
 	}()
-	return errors.Join(<-errs, <-errs)
+	leftErr, rightErr := <-errs, <-errs
+	if leftErr == nil {
+		return rightErr
+	}
+	if rightErr == nil {
+		return leftErr
+	}
+	return errors.Join(leftErr, rightErr)
 }
 
 func (a *MirrorApp) finishBatchAPIError(urls []string, wg *sync.WaitGroup, err error) {
@@ -1187,10 +1194,10 @@ func (a *MirrorApp) fetchDocs(ctx context.Context, urls []string) ([]Document, e
 		return nil, ctx.Err()
 	}
 	defer func() { <-a.apiSem }()
-	a.recordAPIRequest()
 	if err := a.takeTokens(ctx, 1); err != nil {
 		return nil, err
 	}
+	a.recordAPIRequest()
 	names := make([]string, 0, len(urls))
 	for _, u := range urls {
 		names = append(names, a.normalizeForAPI(u))
