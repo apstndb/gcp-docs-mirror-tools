@@ -41,7 +41,6 @@ func (f mirrorRoundTripperFunc) RoundTrip(req *http.Request) (*http.Response, er
 
 func newFetchTestApp(rt http.RoundTripper) *MirrorApp {
 	app := newTestApp()
-	app.ctx = context.Background()
 	app.cfg.QuotaWait = time.Hour
 	app.apiHTTPClient = &http.Client{Transport: rt}
 	app.apiSem = make(chan struct{}, 1)
@@ -80,7 +79,7 @@ func TestProcessBatchRecursiveDoesNotBisectNonDocumentAPIError(t *testing.T) {
 	wg.Add(len(urls))
 	atomic.StoreInt32(&app.inflightCount, int32(len(urls)))
 
-	err := app.processBatchRecursive(urls, &wg)
+	err := app.processBatchRecursive(context.Background(), urls, &wg)
 	if err == nil {
 		t.Fatal("expected non-bisectable API error")
 	}
@@ -176,7 +175,7 @@ func TestProcessBatchRecursivePropagatesSplitChildAPIError(t *testing.T) {
 	wg.Add(len(urls))
 	atomic.StoreInt32(&app.inflightCount, int32(len(urls)))
 
-	err := app.processBatchRecursive(urls, &wg)
+	err := app.processBatchRecursive(context.Background(), urls, &wg)
 	if err == nil {
 		t.Fatal("expected split child API error")
 	}
@@ -210,9 +209,7 @@ func TestFetchDocsWithRetryCancelsQuotaWait(t *testing.T) {
 			Body:       io.NopCloser(strings.NewReader("")),
 		}, nil
 	}))
-	app.ctx = ctx
-
-	_, err := app.fetchDocsWithRetry([]string{"https://docs.cloud.google.com/spanner/docs"})
+	_, err := app.fetchDocsWithRetry(ctx, []string{"https://docs.cloud.google.com/spanner/docs"})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}

@@ -189,7 +189,6 @@ func (s *DiskStorage) LoadProcessedURLUpdateTimes() (map[string]string, error) {
 }
 
 type MirrorApp struct {
-	ctx           context.Context
 	cfg           *Config
 	storage       Storage
 	processedURLs map[string]bool
@@ -349,7 +348,6 @@ func main() {
 	}
 
 	app := &MirrorApp{
-		ctx:           context.Background(),
 		cfg:           cfg,
 		storage:       storage,
 		processedURLs: make(map[string]bool),
@@ -384,7 +382,7 @@ func main() {
 	progressDone := make(chan struct{})
 	go app.reportProgress(stopProgress, progressDone)
 
-	if err := app.Run(seeds); err != nil {
+	if err := app.Run(context.Background(), seeds); err != nil {
 		app.log("Fatal Error: %v", err)
 		os.Exit(1)
 	}
@@ -541,7 +539,7 @@ func (a *MirrorApp) reportProgress(stop <-chan struct{}, done chan<- struct{}) {
 	}
 }
 
-func (a *MirrorApp) Run(seeds []string) error {
+func (a *MirrorApp) Run(ctx context.Context, seeds []string) error {
 	a.log("GCP Docs Mirror Tool %s (%s) built at %s", Version, Commit, BuildTime)
 	a.log("Starting mirror process...")
 	a.log("  - Seeds:    %d", len(seeds))
@@ -558,7 +556,7 @@ func (a *MirrorApp) Run(seeds []string) error {
 	}
 	var activeWork sync.WaitGroup
 	processDone := make(chan error, 1)
-	go func() { processDone <- a.processStream(&activeWork) }()
+	go func() { processDone <- a.processStream(ctx, &activeWork) }()
 
 	if len(a.cfg.Sitemaps) > 0 {
 		atomic.AddInt32(&a.activeDiscovery, 1)
@@ -674,7 +672,7 @@ func (a *MirrorApp) enqueueBatch(urls []string, wg *sync.WaitGroup) {
 	atomic.AddInt32(&a.skippedCount, skipped)
 }
 
-func (a *MirrorApp) processStream(wg *sync.WaitGroup) error {
+func (a *MirrorApp) processStream(ctx context.Context, wg *sync.WaitGroup) error {
 	a.log("Phase 3: Pipelined API Mirroring")
 	type batch []string
 	batches := make(chan batch)
@@ -688,7 +686,7 @@ func (a *MirrorApp) processStream(wg *sync.WaitGroup) error {
 		go func() {
 			defer workerWG.Done()
 			for b := range batches {
-				if err := a.processBatchRecursive(b, wg); err != nil {
+				if err := a.processBatchRecursive(ctx, b, wg); err != nil {
 					errMu.Lock()
 					if firstErr == nil {
 						firstErr = err
@@ -1071,11 +1069,11 @@ func (a *MirrorApp) extractLinksFromMarkdown(source []byte) []string {
 	return links
 }
 
-func (a *MirrorApp) processBatchRecursive(urls []string, wg *sync.WaitGroup) error {
+func (a *MirrorApp) processBatchRecursive(ctx context.Context, urls []string, wg *sync.WaitGroup) error {
 	if len(urls) == 0 {
 		return nil
 	}
-	docs, err := a.fetchDocsWithRetry(urls)
+	docs, err := a.fetchDocsWithRetry(ctx, urls)
 	if err == nil {
 		if err := a.storage.Save(docs...); err != nil {
 			a.log("Storage error: %v", err)
@@ -1126,10 +1124,10 @@ func (a *MirrorApp) processBatchRecursive(urls []string, wg *sync.WaitGroup) err
 	mid := len(urls) / 2
 	errs := make(chan error, 2)
 	go func() {
-		errs <- a.processBatchRecursive(urls[:mid], wg)
+		errs <- a.processBatchRecursive(ctx, urls[:mid], wg)
 	}()
 	go func() {
-		errs <- a.processBatchRecursive(urls[mid:], wg)
+		errs <- a.processBatchRecursive(ctx, urls[mid:], wg)
 	}()
 	return errors.Join(<-errs, <-errs)
 }
@@ -1151,16 +1149,9 @@ func (a *MirrorApp) finishBatchAPIError(urls []string, wg *sync.WaitGroup, err e
 	a.markActivity()
 }
 
-func (a *MirrorApp) context() context.Context {
-	if a.ctx != nil {
-		return a.ctx
-	}
-	return context.Background()
-}
-
-func (a *MirrorApp) fetchDocsWithRetry(urls []string) ([]Document, error) {
+func (a *MirrorApp) fetchDocsWithRetry(ctx context.Context, urls []string) ([]Document, error) {
 	for i := 0; i < 5; i++ {
-		docs, err := a.fetchDocs(urls)
+		docs, err := a.fetchDocs(ctx, urls)
 		if err == nil {
 			return docs, nil
 		}
@@ -1171,7 +1162,7 @@ func (a *MirrorApp) fetchDocsWithRetry(urls []string) ([]Document, error) {
 			a.log("Quota exceeded (429). Waiting %v for window reset (attempt %d/5)...", a.cfg.QuotaWait, i+1)
 			atomic.StoreInt32(&a.isWaitingQuota, 1)
 			a.markActivity()
-			if err := dkapi.SleepContext(a.context(), a.cfg.QuotaWait); err != nil {
+			if err := dkapi.SleepContext(ctx, a.cfg.QuotaWait); err != nil {
 				atomic.StoreInt32(&a.isWaitingQuota, 0)
 				return nil, err
 			}
@@ -1183,7 +1174,7 @@ func (a *MirrorApp) fetchDocsWithRetry(urls []string) ([]Document, error) {
 	return nil, makeSimpleError("Quota exceeded consistently after retries")
 }
 
-func (a *MirrorApp) fetchDocs(urls []string) ([]Document, error) {
+func (a *MirrorApp) fetchDocs(ctx context.Context, urls []string) ([]Document, error) {
 	a.apiSem <- struct{}{}
 	defer func() { <-a.apiSem }()
 	a.recordAPIRequest()
@@ -1197,7 +1188,7 @@ func (a *MirrorApp) fetchDocs(urls []string) ([]Document, error) {
 		BaseURL:    dkapi.DefaultV1BaseURL,
 		APIKey:     a.cfg.APIKey,
 		HTTPClient: a.apiHTTPClient,
-		Context:    a.context(),
+		Context:    ctx,
 		MaxRetries: 0,
 	}
 	return client.BatchGetDocuments(names)
