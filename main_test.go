@@ -285,6 +285,49 @@ func TestFetchDocsHonorsContextWhileWaitingForRateLimiter(t *testing.T) {
 	}
 }
 
+func TestTakeTokensTracksConcurrentQuotaWaiters(t *testing.T) {
+	app := newFetchTestApp(nil)
+	app.limiter = rate.NewLimiter(rate.Every(time.Hour), 1)
+	if !app.limiter.Allow() {
+		t.Fatal("failed to consume initial limiter token")
+	}
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	errCh := make(chan error, 2)
+
+	go func() { errCh <- app.takeTokens(ctx1, 1) }()
+	go func() { errCh <- app.takeTokens(ctx2, 1) }()
+	waitForQuotaWaiters(t, app, 2)
+
+	cancel1()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first error = %v, want context.Canceled", err)
+	}
+	waitForQuotaWaiters(t, app, 1)
+
+	cancel2()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("second error = %v, want context.Canceled", err)
+	}
+	waitForQuotaWaiters(t, app, 0)
+}
+
+func waitForQuotaWaiters(t *testing.T, app *MirrorApp, want int32) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		if got := atomic.LoadInt32(&app.isWaitingQuota); got == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("isWaitingQuota = %d, want %d", atomic.LoadInt32(&app.isWaitingQuota), want)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
 func TestURLPath(t *testing.T) {
 	app := newTestApp()
 	tests := []struct {

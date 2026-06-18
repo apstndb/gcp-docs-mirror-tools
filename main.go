@@ -779,10 +779,17 @@ func (a *MirrorApp) isProcessedSession(u string) bool {
 }
 
 func (a *MirrorApp) takeTokens(ctx context.Context, n int) error {
-	atomic.StoreInt32(&a.isWaitingQuota, 1)
-	defer atomic.StoreInt32(&a.isWaitingQuota, 0)
-	a.markActivity()
+	doneWaiting := a.beginQuotaWait()
+	defer doneWaiting()
 	return a.limiter.WaitN(ctx, n)
+}
+
+func (a *MirrorApp) beginQuotaWait() func() {
+	atomic.AddInt32(&a.isWaitingQuota, 1)
+	a.markActivity()
+	return func() {
+		atomic.AddInt32(&a.isWaitingQuota, -1)
+	}
 }
 
 func (a *MirrorApp) fetchAndExtractLinks(u string, targetClasses []string) []string {
@@ -1160,13 +1167,12 @@ func (a *MirrorApp) fetchDocsWithRetry(ctx context.Context, urls []string) ([]Do
 		var apiErr *APIError
 		if errors.As(err, &rateLimitErr) || (errors.As(err, &apiErr) && (apiErr.Code == 429 || apiErr.Status == "RESOURCE_EXHAUSTED")) {
 			a.log("Quota exceeded (429). Waiting %v for window reset (attempt %d/5)...", a.cfg.QuotaWait, i+1)
-			atomic.StoreInt32(&a.isWaitingQuota, 1)
-			a.markActivity()
-			if err := dkapi.SleepContext(ctx, a.cfg.QuotaWait); err != nil {
-				atomic.StoreInt32(&a.isWaitingQuota, 0)
+			doneWaiting := a.beginQuotaWait()
+			err := dkapi.SleepContext(ctx, a.cfg.QuotaWait)
+			doneWaiting()
+			if err != nil {
 				return nil, err
 			}
-			atomic.StoreInt32(&a.isWaitingQuota, 0)
 			continue
 		}
 		return nil, err
