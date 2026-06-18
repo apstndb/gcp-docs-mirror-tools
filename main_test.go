@@ -105,6 +105,45 @@ func TestProcessBatchRecursiveDoesNotBisectNonDocumentAPIError(t *testing.T) {
 	}
 }
 
+func TestFinishBatchAPIErrorDoesNotPersistContextInterruption(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "canceled", err: context.Canceled},
+		{name: "deadline exceeded", err: context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := newFetchTestApp(nil)
+			urls := []string{
+				"https://docs.cloud.google.com/spanner/docs/a",
+				"https://docs.cloud.google.com/spanner/docs/b",
+			}
+			var wg sync.WaitGroup
+			wg.Add(len(urls))
+			atomic.StoreInt32(&app.inflightCount, int32(len(urls)))
+
+			app.finishBatchAPIError(urls, &wg, tc.err)
+			wg.Wait()
+
+			if got := atomic.LoadInt32(&app.failedCount); got != 0 {
+				t.Fatalf("failedCount = %d, want 0", got)
+			}
+			if got := atomic.LoadInt32(&app.finishedCount); got != int32(len(urls)) {
+				t.Fatalf("finishedCount = %d, want %d", got, len(urls))
+			}
+			if got := atomic.LoadInt32(&app.inflightCount); got != 0 {
+				t.Fatalf("inflightCount = %d, want 0", got)
+			}
+			for _, u := range urls {
+				if _, ok := app.failedURLs[u]; ok {
+					t.Fatalf("failedURLs[%q] was persisted for context interruption", u)
+				}
+			}
+		})
+	}
+}
+
 func TestProcessBatchRecursivePropagatesSplitChildAPIError(t *testing.T) {
 	var requests int32
 	app := newFetchTestApp(mirrorRoundTripperFunc(func(req *http.Request) (*http.Response, error) {

@@ -1136,13 +1136,16 @@ func (a *MirrorApp) processBatchRecursive(urls []string, wg *sync.WaitGroup) err
 
 func (a *MirrorApp) finishBatchAPIError(urls []string, wg *sync.WaitGroup, err error) {
 	a.log("Developer Knowledge API batch failed for %d URL(s): %v", len(urls), err)
+	interrupted := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for _, u := range urls {
-		a.failedURLs[u] = -1
+		if !interrupted {
+			a.failedURLs[u] = -1
+			atomic.AddInt32(&a.failedCount, 1)
+		}
 		atomic.AddInt32(&a.inflightCount, -1)
 		atomic.AddInt32(&a.finishedCount, 1)
-		atomic.AddInt32(&a.failedCount, 1)
 		wg.Done()
 	}
 	a.markActivity()
