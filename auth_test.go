@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	dkapi "github.com/apstndb/developerknowledge-go"
 	"golang.org/x/oauth2"
 )
 
@@ -89,7 +90,7 @@ func TestNewDeveloperKnowledgeHTTPClientUsesADCQuotaProject(t *testing.T) {
 	if apiKey != "" {
 		t.Fatalf("apiKey = %q, want empty string", apiKey)
 	}
-	if _, ok := client.Transport.(*quotaProjectTransport); !ok {
-		t.Fatalf("client.Transport = %T, want *quotaProjectTransport", client.Transport)
+	if _, ok := client.Transport.(*dkapi.QuotaProjectTransport); !ok {
+		t.Fatalf("client.Transport = %T, want *dkapi.QuotaProjectTransport", client.Transport)
 	}
 }

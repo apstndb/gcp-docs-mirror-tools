@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/apstndb/developerknowledge-go"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/text"
@@ -245,24 +246,8 @@ type MirrorApp struct {
 	isCI         bool
 }
 
-type Document struct {
-	Name        string `json:"name" yaml:"name"`
-	URI         string `json:"uri,omitempty" yaml:"uri,omitempty"`
-	Content     string `json:"content,omitempty" yaml:"content,omitempty"`
-	Description string `json:"description,omitempty" yaml:"description,omitempty"`
-	DataSource  string `json:"dataSource,omitempty" yaml:"data_source,omitempty"`
-	Title       string `json:"title,omitempty" yaml:"title,omitempty"`
-	UpdateTime  string `json:"updateTime,omitempty" yaml:"update_time,omitempty"`
-	View        string `json:"view,omitempty" yaml:"view,omitempty"`
-}
-
-type APIError struct {
-	Error struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-		Status  string `json:"status"`
-	} `json:"error"`
-}
+type Document = dkapi.Document
+type APIError = dkapi.APIError
 
 func main() {
 	cfg := DefaultConfig()
@@ -397,7 +382,7 @@ func main() {
 	progressDone := make(chan struct{})
 	go app.reportProgress(stopProgress, progressDone)
 
-	if err := app.Run(seeds); err != nil {
+	if err := app.Run(context.Background(), seeds); err != nil {
 		app.log("Fatal Error: %v", err)
 		os.Exit(1)
 	}
@@ -554,7 +539,7 @@ func (a *MirrorApp) reportProgress(stop <-chan struct{}, done chan<- struct{}) {
 	}
 }
 
-func (a *MirrorApp) Run(seeds []string) error {
+func (a *MirrorApp) Run(ctx context.Context, seeds []string) error {
 	a.log("GCP Docs Mirror Tool %s (%s) built at %s", Version, Commit, BuildTime)
 	a.log("Starting mirror process...")
 	a.log("  - Seeds:    %d", len(seeds))
@@ -571,7 +556,7 @@ func (a *MirrorApp) Run(seeds []string) error {
 	}
 	var activeWork sync.WaitGroup
 	processDone := make(chan error, 1)
-	go func() { processDone <- a.processStream(&activeWork) }()
+	go func() { processDone <- a.processStream(ctx, &activeWork) }()
 
 	if len(a.cfg.Sitemaps) > 0 {
 		atomic.AddInt32(&a.activeDiscovery, 1)
@@ -687,7 +672,7 @@ func (a *MirrorApp) enqueueBatch(urls []string, wg *sync.WaitGroup) {
 	atomic.AddInt32(&a.skippedCount, skipped)
 }
 
-func (a *MirrorApp) processStream(wg *sync.WaitGroup) error {
+func (a *MirrorApp) processStream(ctx context.Context, wg *sync.WaitGroup) error {
 	a.log("Phase 3: Pipelined API Mirroring")
 	type batch []string
 	batches := make(chan batch)
@@ -701,7 +686,7 @@ func (a *MirrorApp) processStream(wg *sync.WaitGroup) error {
 		go func() {
 			defer workerWG.Done()
 			for b := range batches {
-				if err := a.processBatchRecursive(b, wg); err != nil {
+				if err := a.processBatchRecursive(ctx, b, wg); err != nil {
 					errMu.Lock()
 					if firstErr == nil {
 						firstErr = err
@@ -793,11 +778,18 @@ func (a *MirrorApp) isProcessedSession(u string) bool {
 	return a.processedURLs[u] || a.failedURLs[u] != 0 || a.redirects[u] != ""
 }
 
-func (a *MirrorApp) takeTokens(n int) {
-	atomic.StoreInt32(&a.isWaitingQuota, 1)
+func (a *MirrorApp) takeTokens(ctx context.Context, n int) error {
+	doneWaiting := a.beginQuotaWait()
+	defer doneWaiting()
+	return a.limiter.WaitN(ctx, n)
+}
+
+func (a *MirrorApp) beginQuotaWait() func() {
+	atomic.AddInt32(&a.isWaitingQuota, 1)
 	a.markActivity()
-	_ = a.limiter.WaitN(context.Background(), n)
-	atomic.StoreInt32(&a.isWaitingQuota, 0)
+	return func() {
+		atomic.AddInt32(&a.isWaitingQuota, -1)
+	}
 }
 
 func (a *MirrorApp) fetchAndExtractLinks(u string, targetClasses []string) []string {
@@ -1084,12 +1076,12 @@ func (a *MirrorApp) extractLinksFromMarkdown(source []byte) []string {
 	return links
 }
 
-func (a *MirrorApp) processBatchRecursive(urls []string, wg *sync.WaitGroup) error {
+func (a *MirrorApp) processBatchRecursive(ctx context.Context, urls []string, wg *sync.WaitGroup) error {
 	if len(urls) == 0 {
 		return nil
 	}
-	docs, apiErr := a.fetchDocsWithRetry(urls)
-	if apiErr == nil {
+	docs, err := a.fetchDocsWithRetry(ctx, urls)
+	if err == nil {
 		if err := a.storage.Save(docs...); err != nil {
 			a.log("Storage error: %v", err)
 		}
@@ -1124,6 +1116,10 @@ func (a *MirrorApp) processBatchRecursive(urls []string, wg *sync.WaitGroup) err
 		a.mu.Unlock()
 		return nil
 	}
+	if !dkapi.IsBisectableDocumentError(err) {
+		a.finishBatchAPIError(urls, wg, err)
+		return err
+	}
 	if len(urls) == 1 {
 		a.redirectWG.Add(1)
 		go func(u string) {
@@ -1133,75 +1129,88 @@ func (a *MirrorApp) processBatchRecursive(urls []string, wg *sync.WaitGroup) err
 		return nil
 	}
 	mid := len(urls) / 2
-	go a.processBatchRecursive(urls[:mid], wg)
-	go a.processBatchRecursive(urls[mid:], wg)
-	return nil
+	errs := make(chan error, 2)
+	go func() {
+		errs <- a.processBatchRecursive(ctx, urls[:mid], wg)
+	}()
+	go func() {
+		errs <- a.processBatchRecursive(ctx, urls[mid:], wg)
+	}()
+	leftErr, rightErr := <-errs, <-errs
+	if leftErr == nil {
+		return rightErr
+	}
+	if rightErr == nil {
+		return leftErr
+	}
+	return errors.Join(leftErr, rightErr)
 }
 
-func (a *MirrorApp) fetchDocsWithRetry(urls []string) ([]Document, *APIError) {
+func (a *MirrorApp) finishBatchAPIError(urls []string, wg *sync.WaitGroup, err error) {
+	a.log("Developer Knowledge API batch failed for %d URL(s): %v", len(urls), err)
+	interrupted := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, u := range urls {
+		if !interrupted {
+			a.failedURLs[u] = -1
+			atomic.AddInt32(&a.failedCount, 1)
+		}
+		atomic.AddInt32(&a.inflightCount, -1)
+		atomic.AddInt32(&a.finishedCount, 1)
+		wg.Done()
+	}
+	a.markActivity()
+}
+
+func (a *MirrorApp) fetchDocsWithRetry(ctx context.Context, urls []string) ([]Document, error) {
 	for i := 0; i < 5; i++ {
-		docs, apiErr := a.fetchDocs(urls)
-		if apiErr == nil {
+		docs, err := a.fetchDocs(ctx, urls)
+		if err == nil {
 			return docs, nil
 		}
-		if apiErr.Error.Code == 429 || apiErr.Error.Status == "RESOURCE_EXHAUSTED" {
+
+		var rateLimitErr *dkapi.RateLimitError
+		var apiErr *APIError
+		if errors.As(err, &rateLimitErr) || (errors.As(err, &apiErr) && (apiErr.Code == 429 || apiErr.Status == "RESOURCE_EXHAUSTED")) {
 			a.log("Quota exceeded (429). Waiting %v for window reset (attempt %d/5)...", a.cfg.QuotaWait, i+1)
-			atomic.StoreInt32(&a.isWaitingQuota, 1)
-			a.markActivity()
-			time.Sleep(a.cfg.QuotaWait)
-			atomic.StoreInt32(&a.isWaitingQuota, 0)
+			doneWaiting := a.beginQuotaWait()
+			err := dkapi.SleepContext(ctx, a.cfg.QuotaWait)
+			doneWaiting()
+			if err != nil {
+				return nil, err
+			}
 			continue
 		}
-		return nil, apiErr
+		return nil, err
 	}
 	return nil, makeSimpleError("Quota exceeded consistently after retries")
 }
 
-func (a *MirrorApp) fetchDocs(urls []string) ([]Document, *APIError) {
-	a.apiSem <- struct{}{}
+func (a *MirrorApp) fetchDocs(ctx context.Context, urls []string) ([]Document, error) {
+	select {
+	case a.apiSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	defer func() { <-a.apiSem }()
+	if err := a.takeTokens(ctx, 1); err != nil {
+		return nil, err
+	}
 	a.recordAPIRequest()
-	a.takeTokens(1)
-	v := url.Values{}
+	names := make([]string, 0, len(urls))
 	for _, u := range urls {
-		v.Add("names", a.normalizeForAPI(u))
+		names = append(names, a.normalizeForAPI(u))
 	}
-	reqURL := "https://developerknowledge.googleapis.com/v1/documents:batchGet?" + v.Encode()
-	req, _ := http.NewRequest("GET", reqURL, nil)
-	if a.cfg.APIKey != "" {
-		req.Header.Set("X-Goog-Api-Key", a.cfg.APIKey)
+
+	client := &dkapi.Client{
+		BaseURL:    dkapi.DefaultV1BaseURL,
+		APIKey:     a.cfg.APIKey,
+		HTTPClient: a.apiHTTPClient,
+		Context:    ctx,
+		MaxRetries: 0,
 	}
-	resp, err := a.apiHTTPClient.Do(req)
-	if err != nil {
-		return nil, makeSimpleError(err.Error())
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == 429 {
-		apiErr := &APIError{}
-		apiErr.Error.Code, apiErr.Error.Message, apiErr.Error.Status = 429, "Quota exceeded", "RESOURCE_EXHAUSTED"
-		return nil, apiErr
-	}
-	var res struct {
-		Documents []Document `json:"documents"`
-		Error     *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-			Status  string `json:"status"`
-		} `json:"error"`
-	}
-	body, _ := io.ReadAll(resp.Body)
-	if err := json.Unmarshal(body, &res); err != nil {
-		return nil, makeSimpleError(fmt.Sprintf("JSON parse error: %v (Status: %d)", err, resp.StatusCode))
-	}
-	if res.Error != nil {
-		apiErr := &APIError{}
-		apiErr.Error.Code, apiErr.Error.Message, apiErr.Error.Status = res.Error.Code, res.Error.Message, res.Error.Status
-		return nil, apiErr
-	}
-	if resp.StatusCode != 200 {
-		return nil, makeSimpleError(fmt.Sprintf("HTTP Error %d", resp.StatusCode))
-	}
-	return res.Documents, nil
+	return client.BatchGetDocuments(names)
 }
 
 func (a *MirrorApp) normalizeForAPI(u string) string {
@@ -1294,9 +1303,7 @@ func (a *MirrorApp) loadMasterListOnly() {
 }
 
 func makeSimpleError(msg string) *APIError {
-	e := &APIError{}
-	e.Error.Message = msg
-	return e
+	return &APIError{Message: msg}
 }
 
 func parseProcessedURLLogLine(line string) (string, string) {
