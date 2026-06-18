@@ -778,11 +778,11 @@ func (a *MirrorApp) isProcessedSession(u string) bool {
 	return a.processedURLs[u] || a.failedURLs[u] != 0 || a.redirects[u] != ""
 }
 
-func (a *MirrorApp) takeTokens(n int) {
+func (a *MirrorApp) takeTokens(ctx context.Context, n int) error {
 	atomic.StoreInt32(&a.isWaitingQuota, 1)
+	defer atomic.StoreInt32(&a.isWaitingQuota, 0)
 	a.markActivity()
-	_ = a.limiter.WaitN(context.Background(), n)
-	atomic.StoreInt32(&a.isWaitingQuota, 0)
+	return a.limiter.WaitN(ctx, n)
 }
 
 func (a *MirrorApp) fetchAndExtractLinks(u string, targetClasses []string) []string {
@@ -1175,10 +1175,16 @@ func (a *MirrorApp) fetchDocsWithRetry(ctx context.Context, urls []string) ([]Do
 }
 
 func (a *MirrorApp) fetchDocs(ctx context.Context, urls []string) ([]Document, error) {
-	a.apiSem <- struct{}{}
+	select {
+	case a.apiSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	defer func() { <-a.apiSem }()
 	a.recordAPIRequest()
-	a.takeTokens(1)
+	if err := a.takeTokens(ctx, 1); err != nil {
+		return nil, err
+	}
 	names := make([]string, 0, len(urls))
 	for _, u := range urls {
 		names = append(names, a.normalizeForAPI(u))

@@ -221,6 +221,70 @@ func TestFetchDocsWithRetryCancelsQuotaWait(t *testing.T) {
 	}
 }
 
+func TestFetchDocsHonorsContextWhileWaitingForAPISem(t *testing.T) {
+	var requests int32
+	app := newFetchTestApp(mirrorRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		atomic.AddInt32(&requests, 1)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+	}))
+	app.apiSem <- struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := app.fetchDocs(ctx, []string{"https://docs.cloud.google.com/spanner/docs"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if got := atomic.LoadInt32(&requests); got != 0 {
+		t.Fatalf("requests = %d, want 0", got)
+	}
+}
+
+func TestFetchDocsHonorsContextWhileWaitingForRateLimiter(t *testing.T) {
+	var requests int32
+	app := newFetchTestApp(mirrorRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		atomic.AddInt32(&requests, 1)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+	}))
+	app.limiter = rate.NewLimiter(rate.Every(time.Hour), 1)
+	if !app.limiter.Allow() {
+		t.Fatal("failed to consume initial limiter token")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+
+	go func() {
+		_, err := app.fetchDocs(ctx, []string{"https://docs.cloud.google.com/spanner/docs"})
+		errCh <- err
+	}()
+
+	deadline := time.After(time.Second)
+	for atomic.LoadInt32(&app.isWaitingQuota) == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for rate limiter wait")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fetchDocs did not return after context cancellation")
+	}
+	if got := atomic.LoadInt32(&requests); got != 0 {
+		t.Fatalf("requests = %d, want 0", got)
+	}
+	if got := atomic.LoadInt32(&app.isWaitingQuota); got != 0 {
+		t.Fatalf("isWaitingQuota = %d, want 0", got)
+	}
+}
+
 func TestURLPath(t *testing.T) {
 	app := newTestApp()
 	tests := []struct {
