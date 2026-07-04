@@ -54,7 +54,10 @@ gcp-docs-mirror -r -qpm 50 -prefix "/spanner/,/sdk/gcloud/" https://cloud.google
 | `-qpm` | Quota per minute (requests per minute) | `50.0` |
 | `-v` | Enable verbose logging | `false` |
 | `-r` | Enable recursive discovery from Markdown content | `false` |
-| `-f` | Refresh existing documents | `false` |
+| `-f` | Refresh existing documents (loads prior progress from logs) | `false` |
+| `-resume` | Resume from existing progress in logs | `false` |
+| `-discovery` | Discover more links from HTML navigation | `true` |
+| `-stall-timeout` | Max duration without activity before aborting | `0` (disabled) |
 | `-include-update-time` | Include `update_time` in YAML frontmatter | `false` |
 | `-qw` | Wait duration when quota is exceeded | `1m10s` |
 | `-docs` | Output directory for documents | `docs` |
@@ -87,13 +90,12 @@ qw = "70s"
 By default the tool accepts URLs from every domain in the [Developer Knowledge API corpus](https://developers.google.com/knowledge/reference/corpus-reference):
 
 - `adk.dev`, `ai.google.dev`, `antigravity.google`
-- `developer.android.com`, `developer.chrome.com`
+- `cloud.google.com`
+- `dart.dev`, `developer.android.com`, `developer.chrome.com`
 - `developers.google.com`, `developers.home.google.com`
-- `docs.apigee.com`, `docs.cloud.google.com`
+- `docs.apigee.com`, `docs.cloud.google.com`, `docs.flutter.dev`
 - `firebase.google.com`, `fuchsia.dev`
-- `geminicli.com`, `go.dev`, `web.dev`, `www.tensorflow.org`
-
-`cloud.google.com` is aliased to `docs.cloud.google.com` for backward compatibility.
+- `geminicli.com`, `go.dev`, `mapsplatform.google.com`, `web.dev`, `www.tensorflow.org`
 
 ### Prefix syntax
 
