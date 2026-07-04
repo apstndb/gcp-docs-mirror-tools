@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -98,8 +99,8 @@ func TestProcessBatchRecursiveDoesNotBisectNonDocumentAPIError(t *testing.T) {
 		t.Fatalf("inflightCount = %d, want 0", got)
 	}
 	for _, u := range urls {
-		if got := app.failedURLs[u]; got != -1 {
-			t.Fatalf("failedURLs[%q] = %d, want -1", u, got)
+		if got := app.failedURLs[u]; got != failedStatusAPI {
+			t.Fatalf("failedURLs[%q] = %d, want %d", u, got, failedStatusAPI)
 		}
 	}
 }
@@ -191,8 +192,8 @@ func TestProcessBatchRecursivePropagatesSplitChildAPIError(t *testing.T) {
 		t.Fatalf("finishedCount = %d, want %d", got, len(urls))
 	}
 	for _, u := range urls {
-		if got := app.failedURLs[u]; got != -1 {
-			t.Fatalf("failedURLs[%q] = %d, want -1", u, got)
+		if got := app.failedURLs[u]; got != failedStatusAPI {
+			t.Fatalf("failedURLs[%q] = %d, want %d", u, got, failedStatusAPI)
 		}
 	}
 }
@@ -364,7 +365,7 @@ func TestCanonicalHost(t *testing.T) {
 		expected string
 	}{
 		{"docs.cloud.google.com", "docs.cloud.google.com"},
-		{"cloud.google.com", "docs.cloud.google.com"},
+		{"cloud.google.com", "cloud.google.com"},
 		{"developers.google.com", "developers.google.com"},
 		{"DOCS.CLOUD.GOOGLE.COM", "docs.cloud.google.com"},
 		{"example.com", ""},
@@ -389,7 +390,7 @@ func TestResolveAndNormalize(t *testing.T) {
 		{"backup/", "https://docs.cloud.google.com/spanner/docs", "https://docs.cloud.google.com/spanner/docs/backup"},
 		{"dml-versus-mutations.md", "https://docs.cloud.google.com/spanner/docs", "https://docs.cloud.google.com/spanner/docs/dml-versus-mutations"},
 		{"/spanner/docs/concepts/", "https://docs.cloud.google.com/irrelevant", "https://docs.cloud.google.com/spanner/docs/concepts"},
-		{"https://cloud.google.com/spanner/docs/", "https://docs.cloud.google.com/any", "https://docs.cloud.google.com/spanner/docs"},
+		{"https://cloud.google.com/spanner/docs/", "https://docs.cloud.google.com/any", "https://cloud.google.com/spanner/docs"},
 		{"#anchor", "https://docs.cloud.google.com/spanner/docs", "https://docs.cloud.google.com/spanner/docs"},
 		// developers.google.com support
 		{"set-up-gemini", "https://developers.google.com/gemini-code-assist/docs/overview", "https://developers.google.com/gemini-code-assist/docs/overview/set-up-gemini"},
@@ -418,8 +419,8 @@ func TestNormalizeForAPI(t *testing.T) {
 		expected string
 	}{
 		{"https://docs.cloud.google.com/spanner/docs", "documents/docs.cloud.google.com/spanner/docs"},
-		{"https://cloud.google.com/spanner/docs", "documents/docs.cloud.google.com/spanner/docs"},
-		{"cloud.google.com/spanner/docs", "documents/docs.cloud.google.com/spanner/docs"},
+		{"https://cloud.google.com/spanner/docs", "documents/cloud.google.com/spanner/docs"},
+		{"cloud.google.com/spanner/docs", "documents/cloud.google.com/spanner/docs"},
 		{"https://developers.google.com/gemini-code-assist/docs/overview", "documents/developers.google.com/gemini-code-assist/docs/overview"},
 		{"developers.google.com/gemini-code-assist/docs", "documents/developers.google.com/gemini-code-assist/docs"},
 	}
@@ -563,19 +564,23 @@ func TestEnqueueBatch(t *testing.T) {
 	urls := []string{
 		"https://docs.cloud.google.com/allowed/1",
 		"https://docs.cloud.google.com/allowed/1", // Duplicate in same batch
-		"https://cloud.google.com/allowed/1",      // Same after host canonicalization
+		"https://cloud.google.com/allowed/1",      // Distinct corpus host
 		"https://docs.cloud.google.com/blocked/1", // Wrong prefix
 		"https://developers.google.com/allowed/1", // Path matches; allowed across hosts.
 	}
 
 	app.enqueueBatch(urls, &wg)
 
-	if len(app.queueChan) != 2 {
-		t.Fatalf("Expected 2 URLs in queue, got %d", len(app.queueChan))
+	if len(app.queueChan) != 3 {
+		t.Fatalf("Expected 3 URLs in queue, got %d", len(app.queueChan))
 	}
-	got := []string{<-app.queueChan, <-app.queueChan}
+	got := make([]string, 0, 3)
+	for len(got) < 3 {
+		got = append(got, <-app.queueChan)
+	}
 	want := map[string]bool{
 		"https://docs.cloud.google.com/allowed/1": true,
+		"https://cloud.google.com/allowed/1":      true,
 		"https://developers.google.com/allowed/1": true,
 	}
 	for _, u := range got {
@@ -583,6 +588,7 @@ func TestEnqueueBatch(t *testing.T) {
 			t.Errorf("Unexpected URL in queue: %q", u)
 		}
 	}
+	wg.Done()
 	wg.Done()
 	wg.Done()
 	wg.Wait()
@@ -593,7 +599,7 @@ func TestDiskStorage_Save(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	storage := &DiskStorage{docsDir: tmpDir}
 	docs := []Document{
@@ -701,5 +707,37 @@ func TestSaveMetadataWritesURLLogWithUpdateTime(t *testing.T) {
 		"https://docs.cloud.google.com/spanner/docs/backup\t\n"
 	if got != want {
 		t.Fatalf("urls.txt = %q, want %q", got, want)
+	}
+}
+
+func TestDefaultKnownHosts(t *testing.T) {
+	hosts := defaultKnownHosts()
+	required := []string{
+		"cloud.google.com",
+		"dart.dev",
+		"docs.cloud.google.com",
+		"docs.flutter.dev",
+		"mapsplatform.google.com",
+	}
+	for _, h := range required {
+		if !slices.Contains(hosts, h) {
+			t.Errorf("defaultKnownHosts() missing %q", h)
+		}
+	}
+}
+
+func TestLimiterBurst(t *testing.T) {
+	tests := []struct {
+		qpm  float64
+		want int
+	}{
+		{50, 8},
+		{5, 5},
+		{0.5, 1},
+	}
+	for _, tt := range tests {
+		if got := limiterBurst(tt.qpm); got != tt.want {
+			t.Errorf("limiterBurst(%v) = %d, want %d", tt.qpm, got, tt.want)
+		}
 	}
 }
