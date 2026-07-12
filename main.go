@@ -804,8 +804,8 @@ func (a *MirrorApp) saveMetadata() {
 
 	fileCount := 0
 	if a.cfg.SpannerDB == "" {
-		_ = filepath.Walk(a.cfg.DocsDir, func(_ string, info os.FileInfo, err error) error {
-			if err == nil && !info.IsDir() && filepath.Ext(info.Name()) == ".md" {
+		_ = filepath.WalkDir(a.cfg.DocsDir, func(_ string, entry os.DirEntry, err error) error {
+			if err == nil && !entry.IsDir() && filepath.Ext(entry.Name()) == ".md" {
 				fileCount++
 			}
 			return nil
@@ -899,8 +899,8 @@ func (a *MirrorApp) extractLinksWithClassFilter(r io.Reader, targetClasses []str
 
 func (a *MirrorApp) discoverLinksFromMirror() []string {
 	var allDiscovered []string
-	_ = filepath.Walk(a.cfg.DocsDir, func(fpath string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || filepath.Ext(fpath) != ".md" {
+	_ = filepath.WalkDir(a.cfg.DocsDir, func(fpath string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || filepath.Ext(fpath) != ".md" {
 			return nil
 		}
 		relToDocs, _ := filepath.Rel(a.cfg.DocsDir, fpath)
