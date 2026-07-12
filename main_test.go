@@ -40,6 +40,18 @@ func (f mirrorRoundTripperFunc) RoundTrip(req *http.Request) (*http.Response, er
 	return f(req)
 }
 
+type stubStorage struct {
+	err error
+}
+
+func (s stubStorage) Save(...Document) error {
+	return s.err
+}
+
+func (stubStorage) LoadProcessedURLs() (map[string]bool, error) {
+	return nil, nil
+}
+
 func newFetchTestApp(rt http.RoundTripper) *MirrorApp {
 	app := newTestApp()
 	app.cfg.QuotaWait = time.Hour
@@ -102,6 +114,246 @@ func TestProcessBatchRecursiveDoesNotBisectNonDocumentAPIError(t *testing.T) {
 		if got := app.failedURLs[u]; got != failedStatusAPI {
 			t.Fatalf("failedURLs[%q] = %d, want %d", u, got, failedStatusAPI)
 		}
+	}
+}
+
+func TestProcessBatchRecursiveFinishesWorkAfterStorageError(t *testing.T) {
+	storageErr := errors.New("disk full")
+	app := newFetchTestApp(mirrorRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(strings.NewReader(`{
+				"documents": [{
+					"name": "documents/docs.cloud.google.com/spanner/docs/a",
+					"content": "# A"
+				}]
+			}`)),
+		}, nil
+	}))
+	app.storage = stubStorage{err: storageErr}
+	urls := []string{"https://docs.cloud.google.com/spanner/docs/a"}
+	var wg sync.WaitGroup
+	wg.Add(len(urls))
+	atomic.StoreInt32(&app.inflightCount, int32(len(urls)))
+
+	err := app.processBatchRecursive(context.Background(), urls, &wg)
+	if !errors.Is(err, storageErr) {
+		t.Fatalf("error = %v, want %v", err, storageErr)
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("work remained active after storage error")
+	}
+
+	if got := atomic.LoadInt32(&app.failedCount); got != int32(len(urls)) {
+		t.Errorf("failedCount = %d, want %d", got, len(urls))
+	}
+	if got := atomic.LoadInt32(&app.finishedCount); got != int32(len(urls)) {
+		t.Errorf("finishedCount = %d, want %d", got, len(urls))
+	}
+	if got := atomic.LoadInt32(&app.inflightCount); got != 0 {
+		t.Errorf("inflightCount = %d, want 0", got)
+	}
+	if app.processedURLs[urls[0]] {
+		t.Errorf("processedURLs[%q] = true after storage error", urls[0])
+	}
+	if _, ok := app.failedURLs[urls[0]]; ok {
+		t.Errorf("failedURLs[%q] persisted a retryable storage error", urls[0])
+	}
+}
+
+func TestProcessBatchRecursiveFollowsLegacyCloudDocsRedirect(t *testing.T) {
+	const (
+		legacyURL    = "https://cloud.google.com/spanner/docs"
+		canonicalURL = "https://docs.cloud.google.com/spanner/docs"
+	)
+	app := newFetchTestApp(mirrorRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		names := req.URL.Query()["names"]
+		if len(names) != 1 {
+			t.Fatalf("names = %v, want one document name", names)
+		}
+		switch names[0] {
+		case "documents/cloud.google.com/spanner/docs":
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Body: io.NopCloser(strings.NewReader(`{
+					"error": {
+						"code": 404,
+						"message": "requested entity was not found",
+						"status": "NOT_FOUND"
+					}
+				}`)),
+			}, nil
+		case "documents/docs.cloud.google.com/spanner/docs":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(`{
+					"documents": [{
+						"name": "documents/docs.cloud.google.com/spanner/docs",
+						"content": "# Spanner documentation"
+					}]
+				}`)),
+			}, nil
+		default:
+			t.Fatalf("unexpected document name %q", names[0])
+			return nil, nil
+		}
+	}))
+	app.storage = stubStorage{}
+	app.cfg.DocsDir = t.TempDir()
+	app.cfg.Prefixes = []string{"/spanner/docs/"}
+	app.prefixRules = app.parsePrefixes(app.cfg.Prefixes)
+	app.httpSem = make(chan struct{}, 1)
+	app.queueChan = make(chan string, 1)
+	app.sessionQueued = make(map[string]bool)
+	app.noRedirectClient = &http.Client{
+		Transport: mirrorRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case legacyURL:
+				return &http.Response{
+					StatusCode: http.StatusMovedPermanently,
+					Header:     http.Header{"Location": []string{canonicalURL}},
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			case canonicalURL:
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			default:
+				t.Errorf("unexpected HTTP probe URL %q", req.URL.String())
+				return &http.Response{
+					StatusCode: http.StatusInternalServerError,
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			}
+		}),
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	atomic.StoreInt32(&app.inflightCount, 1)
+	if err := app.processBatchRecursive(context.Background(), []string{legacyURL}, &wg); err != nil {
+		t.Fatalf("legacy process error: %v", err)
+	}
+	app.redirectWG.Wait()
+
+	var redirectedURL string
+	select {
+	case redirectedURL = <-app.queueChan:
+	case <-time.After(time.Second):
+		t.Fatal("redirect destination was not enqueued")
+	}
+	if redirectedURL != canonicalURL {
+		t.Fatalf("redirected URL = %q, want %q", redirectedURL, canonicalURL)
+	}
+	if err := app.processBatchRecursive(context.Background(), []string{redirectedURL}, &wg); err != nil {
+		t.Fatalf("redirect destination process error: %v", err)
+	}
+	wg.Wait()
+
+	if got := app.redirects[legacyURL]; got != canonicalURL {
+		t.Errorf("redirects[%q] = %q, want %q", legacyURL, got, canonicalURL)
+	}
+	if !app.processedURLs[canonicalURL] {
+		t.Errorf("processedURLs[%q] = false", canonicalURL)
+	}
+	if _, ok := app.failedURLs[legacyURL]; ok {
+		t.Errorf("failedURLs[%q] was persisted after successful redirect", legacyURL)
+	}
+	if got := atomic.LoadInt32(&app.redirectCount); got != 1 {
+		t.Errorf("redirectCount = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&app.failedCount); got != 0 {
+		t.Errorf("failedCount = %d, want 0", got)
+	}
+	if got := atomic.LoadInt32(&app.finishedCount); got != 2 {
+		t.Errorf("finishedCount = %d, want 2", got)
+	}
+	if got := atomic.LoadInt32(&app.inflightCount); got != 0 {
+		t.Errorf("inflightCount = %d, want 0", got)
+	}
+}
+
+func TestFinishBatchStorageErrorDoesNotCountContextInterruption(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "canceled", err: context.Canceled},
+		{name: "deadline exceeded", err: context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := newFetchTestApp(nil)
+			urls := []string{
+				"https://docs.cloud.google.com/spanner/docs/a",
+				"https://docs.cloud.google.com/spanner/docs/b",
+			}
+			var wg sync.WaitGroup
+			wg.Add(len(urls))
+			atomic.StoreInt32(&app.inflightCount, int32(len(urls)))
+
+			app.finishBatchStorageError(urls, &wg, tc.err)
+			wg.Wait()
+
+			if got := atomic.LoadInt32(&app.failedCount); got != 0 {
+				t.Errorf("failedCount = %d, want 0", got)
+			}
+			if got := atomic.LoadInt32(&app.finishedCount); got != int32(len(urls)) {
+				t.Errorf("finishedCount = %d, want %d", got, len(urls))
+			}
+			if got := atomic.LoadInt32(&app.inflightCount); got != 0 {
+				t.Errorf("inflightCount = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestRequestWindowPreservesRecentHistoryAcrossGap(t *testing.T) {
+	app := &MirrorApp{lastWindowUpdate: 100}
+	app.apiWindow[99%60] = 7
+	app.apiWindow[100%60] = 3
+	app.apiWindow[101%60] = 11
+	app.apiWindow[102%60] = 13
+
+	app.recordWindowRequest(102, &app.apiWindow)
+
+	if got := app.apiWindow[99%60]; got != 7 {
+		t.Errorf("apiWindow[99] = %d, want 7", got)
+	}
+	if got := app.apiWindow[100%60]; got != 3 {
+		t.Errorf("apiWindow[100] = %d, want 3", got)
+	}
+	if got := app.apiWindow[101%60]; got != 0 {
+		t.Errorf("apiWindow[101] = %d, want 0", got)
+	}
+	if got := app.apiWindow[102%60]; got != 1 {
+		t.Errorf("apiWindow[102] = %d, want 1", got)
+	}
+}
+
+func TestRequestWindowCountsConcurrentRequests(t *testing.T) {
+	const requests = 1000
+	app := &MirrorApp{lastWindowUpdate: 100}
+	var wg sync.WaitGroup
+	for range requests {
+		wg.Go(func() {
+			app.recordWindowRequest(101, &app.apiWindow)
+		})
+	}
+	wg.Wait()
+
+	if got := app.apiWindow[101%60]; got != requests {
+		t.Errorf("apiWindow[101] = %d, want %d", got, requests)
 	}
 }
 
@@ -590,6 +842,29 @@ func TestEnqueueBatch(t *testing.T) {
 	}
 	wg.Done()
 	wg.Done()
+	wg.Done()
+	wg.Wait()
+}
+
+func TestEnqueueSeedsAllowsExplicitURLOutsidePrefixes(t *testing.T) {
+	app := newTestApp("docs.cloud.google.com/spanner/")
+	app.processedURLs = make(map[string]bool)
+	app.failedURLs = make(map[string]int)
+	app.redirects = make(map[string]string)
+	app.sessionQueued = make(map[string]bool)
+	app.queueChan = make(chan string, 2)
+
+	const productURL = "https://cloud.google.com/spanner"
+	var wg sync.WaitGroup
+	app.enqueueSeeds([]string{productURL}, &wg)
+	app.enqueueBatch([]string{"https://cloud.google.com/spanner/pricing"}, &wg)
+
+	if got := len(app.queueChan); got != 1 {
+		t.Fatalf("queued URLs = %d, want 1", got)
+	}
+	if got := <-app.queueChan; got != productURL {
+		t.Errorf("queued URL = %q, want %q", got, productURL)
+	}
 	wg.Done()
 	wg.Wait()
 }

@@ -244,6 +244,8 @@ type MirrorApp struct {
 	activeDiscovery int32
 	isWaitingQuota  int32
 
+	// Keep this lock independent from a.mu: do not log or acquire a.mu while held.
+	requestWindowMu  sync.Mutex
 	apiWindow        [60]int32
 	httpWindow       [60]int32
 	lastWindowUpdate int64
@@ -412,47 +414,49 @@ func limiterBurst(qpm float64) int {
 	return b
 }
 
-func (a *MirrorApp) advanceRequestWindow(now int64) {
-	for {
-		last := atomic.LoadInt64(&a.lastWindowUpdate)
-		if last == now {
-			return
-		}
-		if atomic.CompareAndSwapInt64(&a.lastWindowUpdate, last, now) {
-			if now-last > 1 {
-				for i := range a.apiWindow {
-					atomic.StoreInt32(&a.apiWindow[i], 0)
-					atomic.StoreInt32(&a.httpWindow[i], 0)
-				}
-			} else {
-				idx := now % 60
-				atomic.StoreInt32(&a.apiWindow[idx], 0)
-				atomic.StoreInt32(&a.httpWindow[idx], 0)
-			}
-			return
+func (a *MirrorApp) advanceRequestWindowLocked(now int64) {
+	last := a.lastWindowUpdate
+	if last == now {
+		return
+	}
+	if last == 0 || now < last || now-last >= int64(len(a.apiWindow)) {
+		clear(a.apiWindow[:])
+		clear(a.httpWindow[:])
+	} else {
+		for second := last + 1; second <= now; second++ {
+			idx := second % int64(len(a.apiWindow))
+			a.apiWindow[idx] = 0
+			a.httpWindow[idx] = 0
 		}
 	}
+	a.lastWindowUpdate = now
+}
+
+func (a *MirrorApp) recordWindowRequest(now int64, window *[60]int32) {
+	a.requestWindowMu.Lock()
+	defer a.requestWindowMu.Unlock()
+	a.advanceRequestWindowLocked(now)
+	window[now%int64(len(window))]++
 }
 
 func (a *MirrorApp) recordAPIRequest() {
 	atomic.AddInt32(&a.apiReqCount, 1)
-	now := time.Now().Unix()
-	a.advanceRequestWindow(now)
-	atomic.AddInt32(&a.apiWindow[now%60], 1)
+	a.recordWindowRequest(time.Now().Unix(), &a.apiWindow)
 }
 
 func (a *MirrorApp) recordHTTPRequest() {
 	atomic.AddInt32(&a.httpReqCount, 1)
-	now := time.Now().Unix()
-	a.advanceRequestWindow(now)
-	atomic.AddInt32(&a.httpWindow[now%60], 1)
+	a.recordWindowRequest(time.Now().Unix(), &a.httpWindow)
 }
 
 func (a *MirrorApp) getWindowedQPM() (float64, float64) {
+	a.requestWindowMu.Lock()
+	defer a.requestWindowMu.Unlock()
+	a.advanceRequestWindowLocked(time.Now().Unix())
 	var api, http int32
 	for i := 0; i < 60; i++ {
-		api += atomic.LoadInt32(&a.apiWindow[i])
-		http += atomic.LoadInt32(&a.httpWindow[i])
+		api += a.apiWindow[i]
+		http += a.httpWindow[i]
 	}
 	return float64(api), float64(http)
 }
@@ -583,7 +587,7 @@ func (a *MirrorApp) Run(ctx context.Context, seeds []string) error {
 		}()
 	}
 
-	a.enqueueBatch(seeds, &activeWork)
+	a.enqueueSeeds(seeds, &activeWork)
 
 	if a.cfg.Discovery {
 		atomic.AddInt32(&a.activeDiscovery, 1)
@@ -660,13 +664,21 @@ func (a *MirrorApp) enqueue(u string, wg *sync.WaitGroup) {
 }
 
 func (a *MirrorApp) enqueueBatch(urls []string, wg *sync.WaitGroup) {
+	a.enqueueURLs(urls, wg, true)
+}
+
+func (a *MirrorApp) enqueueSeeds(urls []string, wg *sync.WaitGroup) {
+	a.enqueueURLs(urls, wg, false)
+}
+
+func (a *MirrorApp) enqueueURLs(urls []string, wg *sync.WaitGroup, requirePrefix bool) {
 	var toEnqueue []string
 	var discovered, skipped int32
 
 	a.mu.Lock()
 	for _, raw := range urls {
 		u := a.resolveAndNormalize(raw, "")
-		if u == "" || !a.matchesAnyPrefix(u) {
+		if u == "" || (requirePrefix && !a.matchesAnyPrefix(u)) {
 			continue
 		}
 		if a.sessionQueued[u] {
@@ -1116,6 +1128,7 @@ func (a *MirrorApp) processBatchRecursive(ctx context.Context, urls []string, wg
 	docs, err := a.fetchDocsWithRetry(ctx, urls)
 	if err == nil {
 		if err := a.storage.Save(docs...); err != nil {
+			a.finishBatchStorageError(urls, wg, err)
 			return fmt.Errorf("storage save: %w", err)
 		}
 		a.mu.Lock()
@@ -1177,6 +1190,20 @@ func (a *MirrorApp) processBatchRecursive(ctx context.Context, urls []string, wg
 		return leftErr
 	}
 	return errors.Join(leftErr, rightErr)
+}
+
+func (a *MirrorApp) finishBatchStorageError(urls []string, wg *sync.WaitGroup, err error) {
+	a.log("Storage save failed for %d URL(s): %v", len(urls), err)
+	interrupted := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	for range urls {
+		if !interrupted {
+			atomic.AddInt32(&a.failedCount, 1)
+		}
+		atomic.AddInt32(&a.inflightCount, -1)
+		atomic.AddInt32(&a.finishedCount, 1)
+		wg.Done()
+	}
+	a.markActivity()
 }
 
 func (a *MirrorApp) finishBatchAPIError(urls []string, wg *sync.WaitGroup, err error) {
