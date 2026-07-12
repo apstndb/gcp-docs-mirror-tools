@@ -1207,10 +1207,9 @@ func (a *MirrorApp) fetchDocs(ctx context.Context, urls []string) ([]Document, e
 		BaseURL:    dkapi.DefaultV1BaseURL,
 		APIKey:     a.cfg.APIKey,
 		HTTPClient: a.apiHTTPClient,
-		Context:    ctx,
 		MaxRetries: 0,
 	}
-	return client.BatchGetDocuments(names)
+	return client.BatchGetDocuments(ctx, names)
 }
 
 func (a *MirrorApp) normalizeForAPI(u string) string {
