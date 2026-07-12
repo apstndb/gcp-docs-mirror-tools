@@ -3,7 +3,7 @@
 This document provides architectural context and technical guidelines for AI agents working on this repository.
 
 ## Project Purpose
-A high-performance tool to mirror Google developer documentation in Markdown format using the **Developer Knowledge API**. It supports the full Developer Knowledge corpus (15 hosts including `docs.cloud.google.com`, `developers.google.com`, `firebase.google.com`, etc.), recursive discovery, sitemap parsing, and multi-mode storage (Local Disk or Cloud Spanner).
+A high-performance tool to mirror Google developer documentation in Markdown format using the **Developer Knowledge API**. It supports the full Developer Knowledge corpus (including `cloud.google.com`, `docs.cloud.google.com`, `developers.google.com`, and `firebase.google.com`), recursive discovery, sitemap parsing, and multi-mode storage (Local Disk or Cloud Spanner).
 
 ## Core Architecture
 
@@ -11,9 +11,9 @@ A high-performance tool to mirror Google developer documentation in Markdown for
 - **Pipeline**: Pipelined discovery and mirroring.
 - **Queueing**: Uses `queueChan` to decouple discovery from API fetching.
 - **Concurrency**: 
-  - `apiSem` limits concurrent API calls (default: 2) to strictly respect quota.
+  - `apiSem` limits concurrent API calls (default: 8).
   - `numWorkers` (default: 30) handles batch processing and storage.
-- **Rate Limiting**: Implements a Token Bucket (`takeToken`) based on `QuotaPerMinute`.
+- **Rate Limiting**: Implements a Token Bucket (`takeTokens`) based on `QuotaPerMinute`. Burst is capped at `min(8, qpm)` to stay within quota windows.
 
 ### 2. The Discovery Engine
 Discovery happens in multiple parallel phases:
@@ -37,7 +37,8 @@ The Developer Knowledge API has a `batchGet` limit (20). If a batch request fail
 ## Key Data Models
 - **`Config`**: TOML/Flag-based configuration. Includes `default_host` and `extra_hosts` for the multi-host corpus.
 - **`Document`**: Name (API format `documents/HOST/PATH`) and raw Markdown content.
-- **URL Normalization**: URLs are normalized to `https://HOST/PATH` against the known Developer Knowledge corpus hosts (`defaultKnownHosts()` in `main.go`). `cloud.google.com` is aliased to `docs.cloud.google.com`. Trailing slashes, query strings, fragments, and `.md` extensions are stripped.
+- **URL Normalization**: URLs are normalized to `https://HOST/PATH` against the known Developer Knowledge corpus hosts (`defaultKnownHosts()` in `main.go`). Trailing slashes, query strings, fragments, and `.md` extensions are stripped.
+- **Google Cloud hosts**: Treat `cloud.google.com` product pages and `docs.cloud.google.com` technical documentation as distinct API documents. Legacy documentation URLs are resolved by the leaf-failure HTTP redirect path rather than a blanket host alias.
 
 ## Technical Findings & Constraints
 
@@ -48,7 +49,7 @@ Spanner's `ZSTD_DECOMPRESS_TO_STRING` has specific requirements for the compress
 3. **Empty Frames**: Spanner fails to decompress empty Zstd frames (9 bytes). The schema uses an `IF(LENGTH(Content) > 9, ...)` guard to handle this.
 
 ### BatchWrite & Indexing
-When using `BatchWrite`, always ensure the `mutation_groups` indices align perfectly with the input document slice. Filter skipped documents early to maintain consistent indexing in the response stream.
+When using `BatchWrite`, always ensure the `mutation_groups` indices align perfectly with the input document slice. Every document in the batch is appended to `mutatingDocs`/`groups` (unchanged docs receive a `LastCheckedTime`-only mutation) so response indices stay aligned without filtering skipped documents early.
 
 ## Development Workflows
 
@@ -58,7 +59,12 @@ Always use `parseCanonical`, `resolveAndNormalize`, `urlPath`, `urlHost`, and `n
 Prefix matching:
 - `/path/` (path-only) matches under any known host. Pair with `default_host` for single-host mirrors.
 - `host/path/` (host-scoped) matches only that specific host.
+- Explicit seeds bypass prefix filtering; prefixes constrain discovered URLs. Use this to include individual product pages without recursively crawling their host subtree.
 
 ### Authentication
 Prefer `DEVELOPERKNOWLEDGE_API_KEY` or `GOOGLE_API_KEY`. If neither is set, use ADC. Local `authorized_user` ADC requires a quota project via `GOOGLE_CLOUD_QUOTA_PROJECT` or `gcloud auth application-default set-quota-project`.
+
+### Validation
+The validation gate is `go test ./...` (plus `go vet ./...` and `go build ./...` for broader changes). The `Makefile` also provides `make test` (verbose), `make lint` (golangci-lint), and `make build`.
+
 - All content within the repository, including code comments and documentation, MUST be in English.
