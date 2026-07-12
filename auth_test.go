@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,16 +18,12 @@ func TestNewDeveloperKnowledgeHTTPClientPrefersAPIKey(t *testing.T) {
 	t.Setenv("DEVELOPERKNOWLEDGE_API_KEY", "test-key")
 	t.Setenv("GOOGLE_API_KEY", "")
 
-	oldTokenSource := defaultTokenSource
-	defaultTokenSource = func(context.Context, ...string) (oauth2.TokenSource, error) {
-		t.Fatal("defaultTokenSource should not be called when API key is set")
-		return nil, nil
-	}
-	defer func() {
-		defaultTokenSource = oldTokenSource
-	}()
-
-	client, apiKey, err := newDeveloperKnowledgeHTTPClient(context.Background())
+	client, apiKey, err := newDeveloperKnowledgeHTTPClientWithConfig(context.Background(), dkapi.AuthConfig{
+		TokenSource: func(context.Context, ...string) (oauth2.TokenSource, error) {
+			t.Fatal("defaultTokenSource should not be called when API key is set")
+			return nil, nil
+		},
+	})
 	if err != nil {
 		t.Fatalf("newDeveloperKnowledgeHTTPClient returned error: %v", err)
 	}
@@ -41,27 +40,20 @@ func TestNewDeveloperKnowledgeHTTPClientRequiresQuotaProjectForAuthorizedUserADC
 	t.Setenv("GOOGLE_API_KEY", "")
 	t.Setenv("GOOGLE_CLOUD_QUOTA_PROJECT", "")
 
-	oldTokenSource := defaultTokenSource
-	defaultTokenSource = func(context.Context, ...string) (oauth2.TokenSource, error) {
-		return oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test-token"}), nil
-	}
-	defer func() {
-		defaultTokenSource = oldTokenSource
-	}()
-
 	tmpDir := t.TempDir()
 	adcPath := filepath.Join(tmpDir, "application_default_credentials.json")
-	if err := os.WriteFile(adcPath, []byte(`{"type":"authorized_user"}`), 0o644); err != nil {
+	if err := os.WriteFile(adcPath, []byte(`{
+		"type":"authorized_user",
+		"client_id":"test-client",
+		"client_secret":"test-secret",
+		"refresh_token":"test-refresh-token"
+	}`), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
-	oldADCPath := adcCredentialsPath
-	adcCredentialsPath = func() string { return adcPath }
-	defer func() {
-		adcCredentialsPath = oldADCPath
-	}()
-
-	_, _, err := newDeveloperKnowledgeHTTPClient(context.Background())
+	_, _, err := newDeveloperKnowledgeHTTPClientWithConfig(context.Background(), dkapi.AuthConfig{
+		CredentialsPath: func() string { return adcPath },
+	})
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -75,22 +67,35 @@ func TestNewDeveloperKnowledgeHTTPClientUsesADCQuotaProject(t *testing.T) {
 	t.Setenv("GOOGLE_API_KEY", "")
 	t.Setenv("GOOGLE_CLOUD_QUOTA_PROJECT", "test-project")
 
-	oldTokenSource := defaultTokenSource
-	defaultTokenSource = func(context.Context, ...string) (oauth2.TokenSource, error) {
-		return oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test-token"}), nil
-	}
-	defer func() {
-		defaultTokenSource = oldTokenSource
-	}()
+	requestHeaders := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case requestHeaders <- r.Header.Clone():
+		default:
+			t.Error("unexpected additional request")
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer server.Close()
 
-	client, apiKey, err := newDeveloperKnowledgeHTTPClient(context.Background())
+	client, apiKey, err := newDeveloperKnowledgeHTTPClientWithConfig(context.Background(), dkapi.AuthConfig{
+		AllowedOrigin: server.URL,
+		TokenSource: func(context.Context, ...string) (oauth2.TokenSource, error) {
+			return oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test-token"}), nil
+		},
+	})
 	if err != nil {
 		t.Fatalf("newDeveloperKnowledgeHTTPClient returned error: %v", err)
 	}
 	if apiKey != "" {
 		t.Fatalf("apiKey = %q, want empty string", apiKey)
 	}
-	if _, ok := client.Transport.(*dkapi.QuotaProjectTransport); !ok {
-		t.Fatalf("client.Transport = %T, want *dkapi.QuotaProjectTransport", client.Transport)
+	resp, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatalf("client.Get() error = %v", err)
+	}
+	_ = resp.Body.Close()
+	if got := (<-requestHeaders).Get("x-goog-user-project"); got != "test-project" {
+		t.Fatalf("x-goog-user-project = %q, want %q", got, "test-project")
 	}
 }
