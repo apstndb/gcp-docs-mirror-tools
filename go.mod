@@ -7,7 +7,7 @@ retract v0.2.0 // Contains a critical deadlock bug in the pipeline collector.
 require (
 	cloud.google.com/go/spanner v1.88.0
 	github.com/BurntSushi/toml v1.6.0
-	github.com/apstndb/developerknowledge-go v0.1.3-0.20260705140616-7dd29210f40a
+	github.com/apstndb/developerknowledge-go v0.2.0
 	github.com/klauspost/compress v1.18.4
 	github.com/yuin/goldmark v1.7.16
 	golang.org/x/net v0.50.0
