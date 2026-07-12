@@ -69,7 +69,11 @@ func TestNewDeveloperKnowledgeHTTPClientUsesADCQuotaProject(t *testing.T) {
 
 	requestHeaders := make(chan http.Header, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestHeaders <- r.Header.Clone()
+		select {
+		case requestHeaders <- r.Header.Clone():
+		default:
+			t.Error("unexpected additional request")
+		}
 		_, _ = io.WriteString(w, "ok")
 	}))
 	defer server.Close()
