@@ -3,7 +3,7 @@
 This document provides architectural context and technical guidelines for AI agents working on this repository.
 
 ## Project Purpose
-A high-performance tool to mirror Google developer documentation in Markdown format using the **Developer Knowledge API**. It supports the full Developer Knowledge corpus (15 hosts including `docs.cloud.google.com`, `developers.google.com`, `firebase.google.com`, etc.), recursive discovery, sitemap parsing, and multi-mode storage (Local Disk or Cloud Spanner).
+A high-performance tool to mirror Google developer documentation in Markdown format using the **Developer Knowledge API**. It supports the full Developer Knowledge corpus (including `cloud.google.com`, `docs.cloud.google.com`, `developers.google.com`, and `firebase.google.com`), recursive discovery, sitemap parsing, and multi-mode storage (Local Disk or Cloud Spanner).
 
 ## Core Architecture
 
@@ -38,6 +38,7 @@ The Developer Knowledge API has a `batchGet` limit (20). If a batch request fail
 - **`Config`**: TOML/Flag-based configuration. Includes `default_host` and `extra_hosts` for the multi-host corpus.
 - **`Document`**: Name (API format `documents/HOST/PATH`) and raw Markdown content.
 - **URL Normalization**: URLs are normalized to `https://HOST/PATH` against the known Developer Knowledge corpus hosts (`defaultKnownHosts()` in `main.go`). Trailing slashes, query strings, fragments, and `.md` extensions are stripped.
+- **Google Cloud hosts**: Treat `cloud.google.com` product pages and `docs.cloud.google.com` technical documentation as distinct API documents. Legacy documentation URLs are resolved by the leaf-failure HTTP redirect path rather than a blanket host alias.
 
 ## Technical Findings & Constraints
 
@@ -58,7 +59,12 @@ Always use `parseCanonical`, `resolveAndNormalize`, `urlPath`, `urlHost`, and `n
 Prefix matching:
 - `/path/` (path-only) matches under any known host. Pair with `default_host` for single-host mirrors.
 - `host/path/` (host-scoped) matches only that specific host.
+- Explicit seeds bypass prefix filtering; prefixes constrain discovered URLs. Use this to include individual product pages without recursively crawling their host subtree.
 
 ### Authentication
 Prefer `DEVELOPERKNOWLEDGE_API_KEY` or `GOOGLE_API_KEY`. If neither is set, use ADC. Local `authorized_user` ADC requires a quota project via `GOOGLE_CLOUD_QUOTA_PROJECT` or `gcloud auth application-default set-quota-project`.
+
+### Validation
+The validation gate is `go test ./...` (plus `go vet ./...` and `go build ./...` for broader changes). The `Makefile` also provides `make test` (verbose), `make lint` (golangci-lint), and `make build`.
+
 - All content within the repository, including code comments and documentation, MUST be in English.

@@ -41,7 +41,7 @@ export DEVELOPERKNOWLEDGE_API_KEY=your_api_key
 gcp-docs-mirror -config settings.toml
 
 # Or use command line flags
-gcp-docs-mirror -r -qpm 50 -prefix "/spanner/,/sdk/gcloud/" https://cloud.google.com/spanner/docs
+gcp-docs-mirror -r -qpm 50 -prefix "docs.cloud.google.com/spanner/" https://docs.cloud.google.com/spanner/docs
 ```
 
 ### Options
@@ -68,9 +68,14 @@ gcp-docs-mirror -r -qpm 50 -prefix "/spanner/,/sdk/gcloud/" https://cloud.google
 ```toml
 seeds = [
     "https://docs.cloud.google.com/spanner/docs",
-    "https://docs.cloud.google.com/sdk/gcloud/reference/spanner"
+    "https://docs.cloud.google.com/sdk/gcloud/reference/spanner",
+    "https://cloud.google.com/spanner",
 ]
-prefixes = ["/spanner/", "/sdk/gcloud/reference/spanner/"]
+prefixes = [
+    "docs.cloud.google.com/spanner/",
+    "docs.cloud.google.com/sdk/gcloud/reference/spanner/",
+    "cloud.google.com/spanner/docs/",
+]
 recursive = true
 qpm = 50.0
 qw = "70s"
@@ -97,12 +102,20 @@ By default the tool accepts URLs from every domain in the [Developer Knowledge A
 - `firebase.google.com`, `fuchsia.dev`
 - `geminicli.com`, `go.dev`, `mapsplatform.google.com`, `web.dev`, `www.tensorflow.org`
 
+`cloud.google.com` and `docs.cloud.google.com` are distinct API data sources. Product and pricing content can exist only under `cloud.google.com`, while technical documentation generally lives under `docs.cloud.google.com`. Preserve both hosts when both are in scope.
+
+Some legacy documentation URLs under `cloud.google.com` redirect to `docs.cloud.google.com`. The tool first tries the original API document name. When a document-level API error isolates a missing URL, it probes the public URL, records an HTTP redirect, and enqueues the destination. This preserves real `cloud.google.com` documents without losing old links. Because redirect records are not yet loaded on later runs, prefer canonical `docs.cloud.google.com` seeds and use explicit `cloud.google.com` seeds only for product pages confirmed to exist in the API.
+
 ### Prefix syntax
 
 `prefixes` accepts either:
 
 - a **path-only prefix** like `/spanner/docs/`, which matches any known host (use this with `default_host` when you only mirror one host); or
 - a **host-scoped prefix** like `developers.google.com/gemini-code-assist/`, which matches only that host.
+
+Use host-scoped prefixes when mirroring both Google Cloud data sources. Path-only prefixes intentionally match the same path under every known host.
+
+Explicit `seeds` are always fetched, even when they are outside `prefixes`; prefixes constrain URLs found through recursive, HTML, and sitemap discovery. This lets a mirror save a specific `cloud.google.com` product page without recursively crawling product-site links that are not available through the Developer Knowledge API.
 
 ## Output
 File-based mirrors are written as Markdown with YAML frontmatter. By default the frontmatter includes:
