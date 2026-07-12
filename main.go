@@ -29,10 +29,12 @@ import (
 )
 
 const (
-	batchSize            = 20 // Matches Developer Knowledge API limit
-	maxRecursiveDepth    = 5
-	maxConsecutiveErrors = 3
-	diagnosticInterval   = 30 * time.Second
+	batchSize          = 20 // Matches Developer Knowledge API limit
+	diagnosticInterval = 30 * time.Second
+
+	// failedURLs status codes (stored as map values; 0 means unset/absent).
+	failedStatusAPI       = -1 // Developer Knowledge API batch failure
+	failedStatusTransport = -2 // HTTP probe transport error (retryable)
 )
 
 var (
@@ -84,16 +86,20 @@ func defaultKnownHosts() []string {
 		"adk.dev",
 		"ai.google.dev",
 		"antigravity.google",
+		"cloud.google.com",
+		"dart.dev",
 		"developer.android.com",
 		"developer.chrome.com",
 		"developers.google.com",
 		"developers.home.google.com",
 		"docs.apigee.com",
 		"docs.cloud.google.com",
+		"docs.flutter.dev",
 		"firebase.google.com",
 		"fuchsia.dev",
 		"geminicli.com",
 		"go.dev",
+		"mapsplatform.google.com",
 		"web.dev",
 		"www.tensorflow.org",
 	}
@@ -102,9 +108,7 @@ func defaultKnownHosts() []string {
 // defaultHostAliases maps legacy or alternate hostnames to their canonical
 // Developer Knowledge corpus host.
 func defaultHostAliases() map[string]string {
-	return map[string]string{
-		"cloud.google.com": "docs.cloud.google.com",
-	}
+	return map[string]string{}
 }
 
 func DefaultConfig() *Config {
@@ -142,6 +146,9 @@ type DiskStorage struct {
 func (s *DiskStorage) Save(docs ...Document) error {
 	for _, doc := range docs {
 		relPath := strings.TrimPrefix(doc.Name, "documents/")
+		if !filepath.IsLocal(relPath) {
+			return fmt.Errorf("invalid document path: %q", doc.Name)
+		}
 		fullPath := filepath.Join(s.docsDir, relPath+".md")
 		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 			return err
@@ -177,7 +184,7 @@ func (s *DiskStorage) LoadProcessedURLUpdateTimes() (map[string]string, error) {
 	if err != nil {
 		return make(map[string]string), nil
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	processed := make(map[string]string)
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -237,6 +244,8 @@ type MirrorApp struct {
 	activeDiscovery int32
 	isWaitingQuota  int32
 
+	// Keep this lock independent from a.mu: do not log or acquire a.mu while held.
+	requestWindowMu  sync.Mutex
 	apiWindow        [60]int32
 	httpWindow       [60]int32
 	lastWindowUpdate int64
@@ -366,7 +375,7 @@ func main() {
 				return http.ErrUseLastResponse
 			},
 		},
-		limiter:          rate.NewLimiter(rate.Limit(cfg.QuotaPerMinute/60.0), int(cfg.QuotaPerMinute)),
+		limiter:          rate.NewLimiter(rate.Limit(cfg.QuotaPerMinute/60.0), limiterBurst(cfg.QuotaPerMinute)),
 		apiSem:           make(chan struct{}, 8),  // Increased concurrency
 		httpSem:          make(chan struct{}, 20), // Limit concurrent HTTP checks
 		queueChan:        make(chan string, 10000),
@@ -397,47 +406,57 @@ func (a *MirrorApp) markActivity() {
 	atomic.StoreInt64(&a.lastActivity, time.Now().UnixNano())
 }
 
-func (a *MirrorApp) recordAPIRequest() {
-	atomic.AddInt32(&a.apiReqCount, 1)
-	now := time.Now().Unix()
-	idx := now % 60
-	for {
-		last := atomic.LoadInt64(&a.lastWindowUpdate)
-		if last == now {
-			break
-		}
-		if atomic.CompareAndSwapInt64(&a.lastWindowUpdate, last, now) {
-			atomic.StoreInt32(&a.apiWindow[idx], 0)
-			atomic.StoreInt32(&a.httpWindow[idx], 0)
-			break
+func limiterBurst(qpm float64) int {
+	b := min(8, int(qpm))
+	if b < 1 {
+		return 1
+	}
+	return b
+}
+
+func (a *MirrorApp) advanceRequestWindowLocked(now int64) {
+	last := a.lastWindowUpdate
+	if last == now {
+		return
+	}
+	if last == 0 || now < last || now-last >= int64(len(a.apiWindow)) {
+		clear(a.apiWindow[:])
+		clear(a.httpWindow[:])
+	} else {
+		for second := last + 1; second <= now; second++ {
+			idx := second % int64(len(a.apiWindow))
+			a.apiWindow[idx] = 0
+			a.httpWindow[idx] = 0
 		}
 	}
-	atomic.AddInt32(&a.apiWindow[idx], 1)
+	a.lastWindowUpdate = now
+}
+
+func (a *MirrorApp) recordWindowRequest(now int64, window *[60]int32) {
+	a.requestWindowMu.Lock()
+	defer a.requestWindowMu.Unlock()
+	a.advanceRequestWindowLocked(now)
+	window[now%int64(len(window))]++
+}
+
+func (a *MirrorApp) recordAPIRequest() {
+	atomic.AddInt32(&a.apiReqCount, 1)
+	a.recordWindowRequest(time.Now().Unix(), &a.apiWindow)
 }
 
 func (a *MirrorApp) recordHTTPRequest() {
 	atomic.AddInt32(&a.httpReqCount, 1)
-	now := time.Now().Unix()
-	idx := now % 60
-	for {
-		last := atomic.LoadInt64(&a.lastWindowUpdate)
-		if last == now {
-			break
-		}
-		if atomic.CompareAndSwapInt64(&a.lastWindowUpdate, last, now) {
-			atomic.StoreInt32(&a.apiWindow[idx], 0)
-			atomic.StoreInt32(&a.httpWindow[idx], 0)
-			break
-		}
-	}
-	atomic.AddInt32(&a.httpWindow[idx], 1)
+	a.recordWindowRequest(time.Now().Unix(), &a.httpWindow)
 }
 
 func (a *MirrorApp) getWindowedQPM() (float64, float64) {
+	a.requestWindowMu.Lock()
+	defer a.requestWindowMu.Unlock()
+	a.advanceRequestWindowLocked(time.Now().Unix())
 	var api, http int32
 	for i := 0; i < 60; i++ {
-		api += atomic.LoadInt32(&a.apiWindow[i])
-		http += atomic.LoadInt32(&a.httpWindow[i])
+		api += a.apiWindow[i]
+		http += a.httpWindow[i]
 	}
 	return float64(api), float64(http)
 }
@@ -551,7 +570,7 @@ func (a *MirrorApp) Run(ctx context.Context, seeds []string) error {
 		a.log("  - Storage:  Disk (%s)", a.cfg.DocsDir)
 	}
 
-	if a.cfg.Resume {
+	if a.cfg.Resume || a.cfg.Refresh {
 		a.loadMasterListOnly()
 	}
 	var activeWork sync.WaitGroup
@@ -568,7 +587,7 @@ func (a *MirrorApp) Run(ctx context.Context, seeds []string) error {
 		}()
 	}
 
-	a.enqueueBatch(seeds, &activeWork)
+	a.enqueueSeeds(seeds, &activeWork)
 
 	if a.cfg.Discovery {
 		atomic.AddInt32(&a.activeDiscovery, 1)
@@ -645,12 +664,21 @@ func (a *MirrorApp) enqueue(u string, wg *sync.WaitGroup) {
 }
 
 func (a *MirrorApp) enqueueBatch(urls []string, wg *sync.WaitGroup) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.enqueueURLs(urls, wg, true)
+}
+
+func (a *MirrorApp) enqueueSeeds(urls []string, wg *sync.WaitGroup) {
+	a.enqueueURLs(urls, wg, false)
+}
+
+func (a *MirrorApp) enqueueURLs(urls []string, wg *sync.WaitGroup, requirePrefix bool) {
+	var toEnqueue []string
 	var discovered, skipped int32
+
+	a.mu.Lock()
 	for _, raw := range urls {
 		u := a.resolveAndNormalize(raw, "")
-		if u == "" || !a.matchesAnyPrefix(u) {
+		if u == "" || (requirePrefix && !a.matchesAnyPrefix(u)) {
 			continue
 		}
 		if a.sessionQueued[u] {
@@ -665,11 +693,16 @@ func (a *MirrorApp) enqueueBatch(urls []string, wg *sync.WaitGroup) {
 		}
 		atomic.AddInt32(&a.inflightCount, 1)
 		wg.Add(1)
-		a.queueChan <- u
-		a.markActivity()
+		toEnqueue = append(toEnqueue, u)
 	}
 	atomic.AddInt32(&a.discoveredCount, discovered)
 	atomic.AddInt32(&a.skippedCount, skipped)
+	a.mu.Unlock()
+
+	for _, u := range toEnqueue {
+		a.queueChan <- u
+		a.markActivity()
+	}
 }
 
 func (a *MirrorApp) processStream(ctx context.Context, wg *sync.WaitGroup) error {
@@ -728,7 +761,9 @@ func (a *MirrorApp) processStream(ctx context.Context, wg *sync.WaitGroup) error
 
 func (a *MirrorApp) saveMetadata() {
 	if a.cfg.LogDir != "" {
-		os.MkdirAll(a.cfg.LogDir, 0755)
+		if err := os.MkdirAll(a.cfg.LogDir, 0755); err != nil {
+			a.log("Warning: failed to create log directory: %v", err)
+		}
 	}
 
 	a.mu.Lock()
@@ -756,20 +791,30 @@ func (a *MirrorApp) saveMetadata() {
 	a.mu.Unlock()
 
 	if a.cfg.LogDir != "" {
-		os.WriteFile(filepath.Join(a.cfg.LogDir, "urls.txt"), []byte(strings.Join(urlLines, "\n")+"\n"), 0644)
-		os.WriteFile(filepath.Join(a.cfg.LogDir, "failed.txt"), []byte(strings.Join(fails, "\n")+"\n"), 0644)
-		os.WriteFile(filepath.Join(a.cfg.LogDir, "redirects.txt"), []byte(strings.Join(rs, "\n")+"\n"), 0644)
+		if err := os.WriteFile(filepath.Join(a.cfg.LogDir, "urls.txt"), []byte(strings.Join(urlLines, "\n")+"\n"), 0644); err != nil {
+			a.log("Warning: failed to write urls.txt: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(a.cfg.LogDir, "failed.txt"), []byte(strings.Join(fails, "\n")+"\n"), 0644); err != nil {
+			a.log("Warning: failed to write failed.txt: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(a.cfg.LogDir, "redirects.txt"), []byte(strings.Join(rs, "\n")+"\n"), 0644); err != nil {
+			a.log("Warning: failed to write redirects.txt: %v", err)
+		}
 	}
 
 	fileCount := 0
-	filepath.Walk(a.cfg.DocsDir, func(_ string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() && filepath.Ext(info.Name()) == ".md" {
-			fileCount++
-		}
-		return nil
-	})
+	if a.cfg.SpannerDB == "" {
+		_ = filepath.WalkDir(a.cfg.DocsDir, func(_ string, entry os.DirEntry, err error) error {
+			if err == nil && !entry.IsDir() && filepath.Ext(entry.Name()) == ".md" {
+				fileCount++
+			}
+			return nil
+		})
+	}
 	metadata := fmt.Sprintf("file_count: %d\nlast_sync: %s\n", fileCount, time.Now().UTC().Format(time.RFC3339))
-	os.WriteFile(a.cfg.MetadataFile, []byte(metadata), 0644)
+	if err := os.WriteFile(a.cfg.MetadataFile, []byte(metadata), 0644); err != nil {
+		a.log("Warning: failed to write metadata: %v", err)
+	}
 }
 
 func (a *MirrorApp) isProcessedSession(u string) bool {
@@ -798,7 +843,7 @@ func (a *MirrorApp) fetchAndExtractLinks(u string, targetClasses []string) []str
 	if err != nil {
 		return nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	baseURL := a.resolveAndNormalize(resp.Request.URL.String(), "")
 	var results []string
 	for _, l := range a.extractLinksWithClassFilter(resp.Body, targetClasses) {
@@ -854,8 +899,8 @@ func (a *MirrorApp) extractLinksWithClassFilter(r io.Reader, targetClasses []str
 
 func (a *MirrorApp) discoverLinksFromMirror() []string {
 	var allDiscovered []string
-	filepath.Walk(a.cfg.DocsDir, func(fpath string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || filepath.Ext(fpath) != ".md" {
+	_ = filepath.WalkDir(a.cfg.DocsDir, func(fpath string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || filepath.Ext(fpath) != ".md" {
 			return nil
 		}
 		relToDocs, _ := filepath.Rel(a.cfg.DocsDir, fpath)
@@ -1058,7 +1103,7 @@ func (a *MirrorApp) extractLinksFromMarkdown(source []byte) []string {
 	source = stripLeadingFrontmatter(source)
 	reader := text.NewReader(source)
 	doc := a.mdParser.Parser().Parse(reader)
-	ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
 		if entering {
 			var dest string
 			switch node := n.(type) {
@@ -1083,7 +1128,8 @@ func (a *MirrorApp) processBatchRecursive(ctx context.Context, urls []string, wg
 	docs, err := a.fetchDocsWithRetry(ctx, urls)
 	if err == nil {
 		if err := a.storage.Save(docs...); err != nil {
-			a.log("Storage error: %v", err)
+			a.finishBatchStorageError(urls, wg, err)
+			return fmt.Errorf("storage save: %w", err)
 		}
 		a.mu.Lock()
 		processedMap := make(map[string]bool)
@@ -1104,7 +1150,7 @@ func (a *MirrorApp) processBatchRecursive(ctx context.Context, urls []string, wg
 				a.redirectWG.Add(1)
 				go func(url string) {
 					defer a.redirectWG.Done()
-					a.handleLeafFailure(url, wg)
+					_ = a.handleLeafFailure(url, wg)
 				}(u)
 				continue
 			}
@@ -1124,7 +1170,7 @@ func (a *MirrorApp) processBatchRecursive(ctx context.Context, urls []string, wg
 		a.redirectWG.Add(1)
 		go func(u string) {
 			defer a.redirectWG.Done()
-			a.handleLeafFailure(u, wg)
+			_ = a.handleLeafFailure(u, wg)
 		}(urls[0])
 		return nil
 	}
@@ -1146,6 +1192,20 @@ func (a *MirrorApp) processBatchRecursive(ctx context.Context, urls []string, wg
 	return errors.Join(leftErr, rightErr)
 }
 
+func (a *MirrorApp) finishBatchStorageError(urls []string, wg *sync.WaitGroup, err error) {
+	a.log("Storage save failed for %d URL(s): %v", len(urls), err)
+	interrupted := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	for range urls {
+		if !interrupted {
+			atomic.AddInt32(&a.failedCount, 1)
+		}
+		atomic.AddInt32(&a.inflightCount, -1)
+		atomic.AddInt32(&a.finishedCount, 1)
+		wg.Done()
+	}
+	a.markActivity()
+}
+
 func (a *MirrorApp) finishBatchAPIError(urls []string, wg *sync.WaitGroup, err error) {
 	a.log("Developer Knowledge API batch failed for %d URL(s): %v", len(urls), err)
 	interrupted := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
@@ -1153,7 +1213,7 @@ func (a *MirrorApp) finishBatchAPIError(urls []string, wg *sync.WaitGroup, err e
 	defer a.mu.Unlock()
 	for _, u := range urls {
 		if !interrupted {
-			a.failedURLs[u] = -1
+			a.failedURLs[u] = failedStatusAPI
 			atomic.AddInt32(&a.failedCount, 1)
 		}
 		atomic.AddInt32(&a.inflightCount, -1)
@@ -1173,9 +1233,13 @@ func (a *MirrorApp) fetchDocsWithRetry(ctx context.Context, urls []string) ([]Do
 		var rateLimitErr *dkapi.RateLimitError
 		var apiErr *APIError
 		if errors.As(err, &rateLimitErr) || (errors.As(err, &apiErr) && (apiErr.Code == 429 || apiErr.Status == "RESOURCE_EXHAUSTED")) {
-			a.log("Quota exceeded (429). Waiting %v for window reset (attempt %d/5)...", a.cfg.QuotaWait, i+1)
+			wait := a.cfg.QuotaWait
+			if rateLimitErr != nil && rateLimitErr.RetryAfter > 0 {
+				wait = rateLimitErr.RetryAfter
+			}
+			a.log("Quota exceeded (429). Waiting %v for window reset (attempt %d/5)...", wait, i+1)
 			doneWaiting := a.beginQuotaWait()
-			err := dkapi.SleepContext(ctx, a.cfg.QuotaWait)
+			err := dkapi.SleepContext(ctx, wait)
 			doneWaiting()
 			if err != nil {
 				return nil, err
@@ -1184,7 +1248,7 @@ func (a *MirrorApp) fetchDocsWithRetry(ctx context.Context, urls []string) ([]Do
 		}
 		return nil, err
 	}
-	return nil, makeSimpleError("Quota exceeded consistently after retries")
+	return nil, errors.New("quota exceeded consistently after retries")
 }
 
 func (a *MirrorApp) fetchDocs(ctx context.Context, urls []string) ([]Document, error) {
@@ -1238,19 +1302,21 @@ func (a *MirrorApp) handleLeafFailure(u string, wg *sync.WaitGroup) error {
 
 	curr := u
 	lastStatus := 0
+	transportErr := false
 	for i := 0; i < 10; i++ {
 		a.recordHTTPRequest()
 		resp, err := a.noRedirectClient.Get(curr)
 		if err != nil {
+			transportErr = true
 			break
 		}
 		lastStatus = resp.StatusCode
 		if resp.StatusCode/100 != 3 {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			break
 		}
 		loc := resp.Header.Get("Location")
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if loc == "" {
 			break
 		}
@@ -1269,13 +1335,20 @@ func (a *MirrorApp) handleLeafFailure(u string, wg *sync.WaitGroup) error {
 		atomic.AddInt32(&a.redirectCount, 1)
 		a.mu.Unlock()
 		a.enqueue(curr, wg)
+	} else if transportErr {
+		a.mu.Lock()
+		a.failedURLs[u] = failedStatusTransport
+		atomic.AddInt32(&a.failedCount, 1)
+		a.mu.Unlock()
 	} else {
 		a.mu.Lock()
 		a.failedURLs[u] = lastStatus
 		atomic.AddInt32(&a.failedCount, 1)
 		a.mu.Unlock()
-		lpath := filepath.Join(a.cfg.DocsDir, strings.TrimPrefix(a.normalizeForAPI(u), "documents/")+".md")
-		os.Remove(lpath)
+		if lastStatus == http.StatusNotFound || lastStatus == http.StatusGone {
+			lpath := filepath.Join(a.cfg.DocsDir, strings.TrimPrefix(a.normalizeForAPI(u), "documents/")+".md")
+			_ = os.Remove(lpath)
+		}
 	}
 	atomic.AddInt32(&a.inflightCount, -1)
 	atomic.AddInt32(&a.finishedCount, 1)
@@ -1300,11 +1373,6 @@ func (a *MirrorApp) loadMasterListOnly() {
 	}
 	a.mu.Unlock()
 }
-
-func makeSimpleError(msg string) *APIError {
-	return &APIError{Message: msg}
-}
-
 func parseProcessedURLLogLine(line string) (string, string) {
 	line = strings.TrimSpace(line)
 	if line == "" {

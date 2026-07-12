@@ -32,7 +32,7 @@ func (a *MirrorApp) DiscoverFromSitemaps(sitemapURLs []string, activeWork *sync.
 			atomic.AddInt32(&a.sitemapDone, 1)
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		decoder := xml.NewDecoder(resp.Body)
 		var batch []string
@@ -46,29 +46,31 @@ func (a *MirrorApp) DiscoverFromSitemaps(sitemapURLs []string, activeWork *sync.
 				break
 			}
 
-			switch se := t.(type) {
-			case xml.StartElement:
-				if se.Name.Local == "sitemap" {
-					var entry locEntry
-					if err := decoder.DecodeElement(&entry, &se); err == nil {
-						atomic.AddInt32(&a.sitemapTotal, 1)
-						sitemapWG.Add(1)
-						go func() { crawl(entry.Loc) }()
-					}
-				} else if se.Name.Local == "url" {
-					var entry locEntry
-					if err := decoder.DecodeElement(&entry, &se); err == nil {
-						// Every <url> tag found is a "raw" scanned URL
-						atomic.AddInt32(&a.scannedRawCount, 1)
-						
-						normalized := a.resolveAndNormalize(entry.Loc, "/")
-						if normalized != "" {
-							batch = append(batch, normalized)
-							if len(batch) >= 100 {
-								a.enqueueBatch(batch, activeWork)
-								count += len(batch)
-								batch = nil
-							}
+			se, ok := t.(xml.StartElement)
+			if !ok {
+				continue
+			}
+			switch se.Name.Local {
+			case "sitemap":
+				var entry locEntry
+				if err := decoder.DecodeElement(&entry, &se); err == nil {
+					atomic.AddInt32(&a.sitemapTotal, 1)
+					sitemapWG.Add(1)
+					go func() { crawl(entry.Loc) }()
+				}
+			case "url":
+				var entry locEntry
+				if err := decoder.DecodeElement(&entry, &se); err == nil {
+					// Every <url> tag found is a "raw" scanned URL
+					atomic.AddInt32(&a.scannedRawCount, 1)
+
+					normalized := a.resolveAndNormalize(entry.Loc, "/")
+					if normalized != "" {
+						batch = append(batch, normalized)
+						if len(batch) >= 100 {
+							a.enqueueBatch(batch, activeWork)
+							count += len(batch)
+							batch = nil
 						}
 					}
 				}
