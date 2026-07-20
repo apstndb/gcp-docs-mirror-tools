@@ -3,13 +3,8 @@ package main
 import (
 	"context"
 	"net/http"
-	"time"
 
 	"github.com/apstndb/developerknowledge-go"
-)
-
-const (
-	apiHTTPTimeout = time.Minute
 )
 
 func newDeveloperKnowledgeHTTPClient(ctx context.Context) (*http.Client, string, error) {
@@ -18,6 +13,6 @@ func newDeveloperKnowledgeHTTPClient(ctx context.Context) (*http.Client, string,
 
 func newDeveloperKnowledgeHTTPClientWithConfig(ctx context.Context, cfg dkapi.AuthConfig) (*http.Client, string, error) {
 	cfg.Mode = dkapi.AuthPreferAPIKey
-	cfg.Timeout = apiHTTPTimeout
+	cfg.Timeout = dkapi.DefaultHTTPTimeout
 	return dkapi.NewAuthenticatedHTTPClient(ctx, cfg)
 }

@@ -29,7 +29,6 @@ import (
 )
 
 const (
-	batchSize          = 20 // Matches Developer Knowledge API limit
 	diagnosticInterval = 30 * time.Second
 
 	// failedURLs status codes (stored as map values; 0 means unset/absent).
@@ -750,7 +749,7 @@ func (a *MirrorApp) processStream(ctx context.Context, wg *sync.WaitGroup) error
 				return firstErr
 			}
 			currentBatch = append(currentBatch, u)
-			if len(currentBatch) >= batchSize {
+			if len(currentBatch) >= dkapi.MaxBatchGetDocuments {
 				flush()
 			}
 		case <-ticker.C:

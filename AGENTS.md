@@ -23,7 +23,7 @@ Discovery happens in multiple parallel phases:
 - **Refresh**: Re-queues already processed URLs.
 
 ### 3. Adaptive Batching (`processBatchRecursive`)
-The Developer Knowledge API has a `batchGet` limit (20). If a batch request fails, the tool uses a **recursive binary search** (splitting the batch) to isolate the specific problematic URL (e.g., a 404 or a redirect) without failing the entire batch.
+The tool derives its `batchGet` batch size from `dkapi.MaxBatchGetDocuments`. If a batch request fails, the tool uses a **recursive binary search** (splitting the batch) to isolate the specific problematic URL (e.g., a 404 or a redirect) without failing the entire batch.
 
 ### 4. Storage Providers (`Storage` Interface)
 - **DiskStorage**: Saves as `.md` files in a nested directory structure.
