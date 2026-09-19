@@ -1130,6 +1130,25 @@ func (a *MirrorApp) processBatchRecursive(ctx context.Context, urls []string, wg
 			a.finishBatchStorageError(urls, wg, err)
 			return fmt.Errorf("storage save: %w", err)
 		}
+		if a.cfg.Recursive {
+			// Keep work active before completing this batch. Enqueue separately:
+			// workers must not all block producing into the queue they consume.
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for _, doc := range docs {
+					base := a.apiNameToURL(doc.Name)
+					if base == "" {
+						continue
+					}
+					var links []string
+					for _, link := range a.extractLinksFromMarkdown([]byte(doc.Content)) {
+						links = append(links, a.resolveAndNormalize(link, base))
+					}
+					a.enqueueBatch(links, wg)
+				}
+			}()
+		}
 		a.mu.Lock()
 		processedMap := make(map[string]bool)
 		for _, doc := range docs {
