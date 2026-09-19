@@ -16,8 +16,16 @@ import (
 )
 
 func TestRecursiveFetchDiscoversFreshContent(t *testing.T) {
-	for _, recursive := range []bool{false, true} {
-		t.Run(fmt.Sprint(recursive), func(t *testing.T) {
+	for _, tc := range []struct {
+		recursive bool
+		prefix    string
+	}{
+		{false, "docs.cloud.google.com/test/"},
+		{true, "docs.cloud.google.com/test/"},
+		{true, "/"},
+		{true, "docs.cloud.google.com/"},
+	} {
+		t.Run(fmt.Sprintf("%t/%s", tc.recursive, tc.prefix), func(t *testing.T) {
 			var mu sync.Mutex
 			seen := map[string]int{}
 			app := newFetchTestApp(mirrorRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
@@ -33,6 +41,7 @@ func TestRecursiveFetchDiscoversFreshContent(t *testing.T) {
 							content += fmt.Sprintf("\n[child](https://docs.cloud.google.com/test/child%d)", i)
 						}
 						content += "\n[outside](https://docs.cloud.google.com/other/page)"
+						content += "\n[external](https://example.com/unknown)"
 					} else if strings.HasSuffix(name, "/child0") {
 						content += "\n[grandchild](https://docs.cloud.google.com/test/grandchild)"
 					}
@@ -44,10 +53,10 @@ func TestRecursiveFetchDiscoversFreshContent(t *testing.T) {
 				}
 				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(string(body)))}, nil
 			}))
-			app.cfg.Recursive = recursive
+			app.cfg.Recursive = tc.recursive
 			app.cfg.DocsDir = t.TempDir()
 			app.cfg.MetadataFile = filepath.Join(app.cfg.DocsDir, "metadata.yaml")
-			app.cfg.Prefixes = []string{"docs.cloud.google.com/test/"}
+			app.cfg.Prefixes = []string{tc.prefix}
 			app.prefixRules = app.parsePrefixes(app.cfg.Prefixes)
 			app.storage = stubStorage{}
 			app.mdParser = goldmark.New()
@@ -64,8 +73,11 @@ func TestRecursiveFetchDiscoversFreshContent(t *testing.T) {
 				t.Fatal("recursive discovery deadlocked")
 			}
 			want := 1
-			if recursive {
+			if tc.recursive {
 				want = 702
+				if tc.prefix != "docs.cloud.google.com/test/" {
+					want++ // The same-host /other/page link is in scope.
+				}
 			}
 			mu.Lock()
 			defer mu.Unlock()
@@ -73,7 +85,7 @@ func TestRecursiveFetchDiscoversFreshContent(t *testing.T) {
 				t.Fatalf("fetched %d unique documents, want %d", len(seen), want)
 			}
 			for name, count := range seen {
-				if count != 1 || strings.Contains(name, "/other/") {
+				if count != 1 || (tc.prefix == "docs.cloud.google.com/test/" && strings.Contains(name, "/other/")) || name == "documents/docs.cloud.google.com/" {
 					t.Errorf("unexpected fetch: %s (%d times)", name, count)
 				}
 			}

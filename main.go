@@ -1143,7 +1143,11 @@ func (a *MirrorApp) processBatchRecursive(ctx context.Context, urls []string, wg
 					}
 					var links []string
 					for _, link := range a.extractLinksFromMarkdown([]byte(doc.Content)) {
-						links = append(links, a.resolveAndNormalize(link, base))
+						// Do not re-enqueue rejected links: an empty input resolves
+						// to the default-host root when normalized without a base.
+						if normalized := a.resolveAndNormalize(link, base); normalized != "" {
+							links = append(links, normalized)
+						}
 					}
 					a.enqueueBatch(links, wg)
 				}
