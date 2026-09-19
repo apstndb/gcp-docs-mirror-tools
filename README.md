@@ -4,6 +4,7 @@ A high-performance, robust tool to recursively discover and mirror Google Cloud 
 
 ## Features
 - **Intelligent Discovery**: Uses Goldmark (Markdown AST) and HTML parsing to accurately identify links in sidebars and navigation bars.
+- **Recursive Content Discovery**: With `-r`, follows links in newly fetched Markdown as well as existing local files, including on the first run. Host-scoped prefixes constrain discovered links and cycles are deduplicated within the run.
 - **Island Hopping**: Automatically navigates between different documentation "islands" (Overview, Guides, Reference, Samples) by scanning top-level navigation.
 - **Adaptive Batching**: Uses a recursive binary-search algorithm to isolate missing pages or redirects within atomic batch requests.
 - **Normalization**: Automatically normalizes URLs (strips trailing slashes, fragments, and `.md` extensions) to ensure consistency and prevent redundant downloads.

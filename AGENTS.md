@@ -19,7 +19,7 @@ A high-performance tool to mirror Google developer documentation in Markdown for
 Discovery happens in multiple parallel phases:
 - **Sitemaps (`sitemap.go`)**: Pipelined XML parsing to seed the queue.
 - **HTML Navigation (`fetchAndExtractLinks`)**: Scans `devsite-tabs-wrapper` (Islands) and `devsite-nav-list` (Sidebars).
-- **Recursive (`discoverLinksFromMirror`)**: Scans local Markdown files for links using Goldmark AST.
+- **Recursive**: Scans existing local Markdown and newly fetched document bodies using Goldmark AST. Follow-up enqueueing keeps the active-work count nonzero and runs outside batch workers to avoid a producer/consumer deadlock on a full queue.
 - **Refresh**: Re-queues already processed URLs.
 
 ### 3. Adaptive Batching (`processBatchRecursive`)
