@@ -26,7 +26,9 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          # Release binaries must include fixes from a supported Go toolchain.
+          go-version: '1.27'
+          check-latest: true
 
       - name: Build
         env:
