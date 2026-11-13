@@ -41,6 +41,12 @@ jobs:
           go build -ldflags "-X main.Version=${{ github.ref_name }} -X main.Commit=${{ github.sha }} -X main.BuildTime=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" -o dist/${BINARY_NAME} .
           cd dist && tar czf ../gcp-docs-mirror-tools-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz ${BINARY_NAME}
 
+      - name: Scan release binary
+        run: |
+          BINARY_NAME=gcp-docs-mirror-tools
+          [ "${{ matrix.goos }}" = "windows" ] && BINARY_NAME=${BINARY_NAME}.exe
+          go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -mode=binary "dist/${BINARY_NAME}"
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:

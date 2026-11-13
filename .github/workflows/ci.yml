@@ -72,3 +72,10 @@ jobs:
 
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+      - name: Build security scan binary
+        run: go build -o "$RUNNER_TEMP/mirror-security" .
+
+      - name: Scan linked binary symbols
+        # Binary scanning also finds linked symbols outside the source call graph.
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -mode=binary "$RUNNER_TEMP/mirror-security"
