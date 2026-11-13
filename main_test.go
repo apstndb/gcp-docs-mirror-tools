@@ -675,6 +675,8 @@ func TestNormalizeForAPI(t *testing.T) {
 		{"cloud.google.com/spanner/docs", "documents/cloud.google.com/spanner/docs"},
 		{"https://developers.google.com/gemini-code-assist/docs/overview", "documents/developers.google.com/gemini-code-assist/docs/overview"},
 		{"developers.google.com/gemini-code-assist/docs", "documents/developers.google.com/gemini-code-assist/docs"},
+		{"https://genkit.dev/docs/get-started/", "documents/genkit.dev/docs/get-started"},
+		{"https://knowledge.workspace.google.com/admin", "documents/knowledge.workspace.google.com/admin"},
 	}
 
 	for _, tt := range tests {

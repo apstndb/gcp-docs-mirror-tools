@@ -101,7 +101,8 @@ By default the tool accepts URLs from every domain in the [Developer Knowledge A
 - `developers.google.com`, `developers.home.google.com`
 - `docs.apigee.com`, `docs.cloud.google.com`, `docs.flutter.dev`
 - `firebase.google.com`, `fuchsia.dev`
-- `geminicli.com`, `go.dev`, `mapsplatform.google.com`, `web.dev`, `www.tensorflow.org`
+- `geminicli.com`, `genkit.dev`, `go.dev`, `knowledge.workspace.google.com`
+- `mapsplatform.google.com`, `web.dev`, `www.tensorflow.org`
 
 `cloud.google.com` and `docs.cloud.google.com` are distinct API data sources. Product and pricing content can exist only under `cloud.google.com`, while technical documentation generally lives under `docs.cloud.google.com`. Preserve both hosts when both are in scope.
 
