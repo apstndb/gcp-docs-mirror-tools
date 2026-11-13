@@ -54,3 +54,21 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          # Scan with a supported toolchain without raising the source minimum.
+          go-version: '1.27'
+          check-latest: true
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
